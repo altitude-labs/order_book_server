@@ -11,7 +11,7 @@ use log::{error, info};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 use tokio::process::Command;
@@ -44,6 +44,16 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
                 .visor_state_path
                 .clone()
                 .unwrap_or_else(|| parent_dir.join("hyperliquid_data/visor_abci_state.json"));
+            let abci_path = resolve_abci_state_path(config);
+            let container_abci_path = docker_container_path(&abci_path, parent_dir);
+            let container_output_path = docker_container_path(&output_path, parent_dir);
+
+            info!(
+                "Running: docker exec {} ./hl-node --chain Mainnet compute-l4-snapshots --include-users {} {}",
+                &config.docker_container,
+                container_abci_path.display(),
+                container_output_path.display()
+            );
 
             let output = Command::new("docker")
                 .args(&[
@@ -54,8 +64,8 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
                     "Mainnet",
                     "compute-l4-snapshots",
                     "--include-users",
-                    "hl/hyperliquid_data/abci_state.rmp",
-                    "hl/snapshot.json",
+                    container_abci_path.to_str().unwrap_or(""),
+                    container_output_path.to_str().unwrap_or(""),
                 ])
                 .output()
                 .await;
@@ -78,16 +88,13 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
         }
         SnapshotMode::Direct => {
             // Direct mode: run hl-node directly on host
-            let abci_path = config
-                .abci_state_path
-                .clone()
-                .unwrap_or_else(|| config.data_dir.join("hl/hyperliquid_data/abci_state.rmp"));
+            let abci_path = resolve_abci_state_path(config);
             let output_path =
                 config.snapshot_output_path.clone().unwrap_or_else(|| PathBuf::from("/tmp/hl_snapshot.json"));
             let visor_path = config
                 .visor_state_path
                 .clone()
-                .unwrap_or_else(|| config.data_dir.join("hl/hyperliquid_data/visor_abci_state.json"));
+                .unwrap_or_else(|| get_default_visor_path(&config.data_dir));
 
             info!(
                 "Running: {} --chain Mainnet compute-l4-snapshots --include-users {} {}",
@@ -150,11 +157,76 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
     Err("Snapshot file not created".into())
 }
 
+fn resolve_abci_state_path(config: &SnapshotConfig) -> PathBuf {
+    if let Some(path) = config.abci_state_path.clone() {
+        return path;
+    }
+
+    if let Some(path) = find_latest_periodic_abci_state(&config.data_dir) {
+        info!("Using latest periodic ABCI state: {}", path.display());
+        return path;
+    }
+
+    let path = get_default_abci_state_path(&config.data_dir);
+    info!("Using legacy ABCI state path: {}", path.display());
+    path
+}
+
+fn get_default_abci_state_path(data_dir: &Path) -> PathBuf {
+    data_dir
+        .parent()
+        .unwrap_or(data_dir)
+        .join("hyperliquid_data/abci_state.rmp")
+}
+
+fn get_default_visor_path(data_dir: &Path) -> PathBuf {
+    data_dir
+        .parent()
+        .unwrap_or(data_dir)
+        .join("hyperliquid_data/visor_abci_state.json")
+}
+
+fn docker_container_path(host_path: &Path, host_root: &Path) -> PathBuf {
+    if host_path.is_relative() {
+        return host_path.to_path_buf();
+    }
+
+    host_path
+        .strip_prefix(host_root)
+        .map(|relative| PathBuf::from("hl").join(relative))
+        .unwrap_or_else(|_| host_path.to_path_buf())
+}
+
+fn find_latest_periodic_abci_state(data_dir: &Path) -> Option<PathBuf> {
+    let root = data_dir.join("periodic_abci_states");
+    let mut stack = vec![root];
+    let mut latest: Option<PathBuf> = None;
+
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rmp")
+                && latest.as_ref().is_none_or(|current| path > *current)
+            {
+                latest = Some(path);
+            }
+        }
+    }
+
+    latest
+}
+
 /// Current node height from `visor_abci_state.json`, or None if unreadable.
 /// Used as the startup-backfill floor: the initial snapshot's height is never
 /// below this value (the snapshot is generated after boot and heights only
 /// advance), so every line at or below it is already covered by the snapshot.
-pub(super) fn read_visor_height(visor_path: &std::path::Path) -> Option<u64> {
+pub(super) fn read_visor_height(visor_path: &Path) -> Option<u64> {
     let contents = fs::read_to_string(visor_path).ok()?;
     let visor: serde_json::Value = serde_json::from_str(&contents).ok()?;
     visor["height"].as_u64()
@@ -165,10 +237,7 @@ pub(super) fn read_visor_height(visor_path: &std::path::Path) -> Option<u64> {
 /// data_dir should be the path containing node_*_by_block directories
 /// visor_abci_state.json is in parent/hyperliquid_data/
 pub(super) fn get_visor_path(config: &SnapshotConfig) -> PathBuf {
-    config.visor_state_path.clone().unwrap_or_else(|| {
-        let parent_dir = config.data_dir.parent().unwrap_or(&config.data_dir);
-        parent_dir.join("hyperliquid_data/visor_abci_state.json")
-    })
+    config.visor_state_path.clone().unwrap_or_else(|| get_default_visor_path(&config.data_dir))
 }
 
 impl L2SnapshotParams {
@@ -301,7 +370,7 @@ pub(super) enum EventBatch {
 mod tests {
     use super::*;
     use crate::{
-        order_book::{Px, Side, Sz, multi_book::Snapshots, types::InnerOrder},
+        order_book::{Px, Side, Sz, multi_book::Snapshots},
         types::inner::InnerL4Order,
     };
     use alloy::primitives::Address;
@@ -357,6 +426,39 @@ mod tests {
 
         assert_eq!(read_visor_height(&dir.join("missing.json")), None);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_find_latest_periodic_abci_state() {
+        let dir = std::env::temp_dir().join(format!("obs_abci_test_{}", std::process::id()));
+        let data_dir = dir.join("data");
+        let dated_dir = data_dir.join("periodic_abci_states/20260624");
+        fs::create_dir_all(&dated_dir).unwrap();
+        fs::write(dated_dir.join("1047380000.rmp"), b"old").unwrap();
+        fs::write(dated_dir.join("1047420000.rmp"), b"new").unwrap();
+        fs::write(dated_dir.join("not_snapshot.txt"), b"ignore").unwrap();
+
+        assert_eq!(
+            find_latest_periodic_abci_state(&data_dir),
+            Some(dated_dir.join("1047420000.rmp"))
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_docker_container_path_maps_host_hl_root() {
+        assert_eq!(
+            docker_container_path(
+                Path::new("/data/hl/data/periodic_abci_states/20260624/1047420000.rmp"),
+                Path::new("/data/hl")
+            ),
+            PathBuf::from("hl/data/periodic_abci_states/20260624/1047420000.rmp")
+        );
+        assert_eq!(
+            docker_container_path(Path::new("hl/data/manual.rmp"), Path::new("/data/hl")),
+            PathBuf::from("hl/data/manual.rmp")
+        );
     }
 
     #[test]
