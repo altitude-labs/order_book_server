@@ -39,7 +39,8 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
             // data_dir should be the path containing node_*_by_block directories
             // Snapshot goes to parent of data_dir (sibling to "data" folder)
             let parent_dir = config.data_dir.parent().unwrap_or(&config.data_dir);
-            let output_path = config.snapshot_output_path.clone().unwrap_or_else(|| parent_dir.join("snapshot.json"));
+            let output_path =
+                config.snapshot_output_path.clone().unwrap_or_else(|| get_default_docker_snapshot_output_path(parent_dir));
             let visor_path = config
                 .visor_state_path
                 .clone()
@@ -184,6 +185,10 @@ fn get_default_visor_path(data_dir: &Path) -> PathBuf {
         .parent()
         .unwrap_or(data_dir)
         .join("hyperliquid_data/visor_abci_state.json")
+}
+
+fn get_default_docker_snapshot_output_path(parent_dir: &Path) -> PathBuf {
+    parent_dir.join("hyperliquid_data/orderbook_snapshot.json")
 }
 
 fn docker_container_path(host_path: &Path, host_root: &Path) -> PathBuf {
@@ -458,6 +463,16 @@ mod tests {
         assert_eq!(
             docker_container_path(Path::new("hl/data/manual.rmp"), Path::new("/data/hl")),
             PathBuf::from("hl/data/manual.rmp")
+        );
+    }
+
+    #[test]
+    fn test_default_docker_snapshot_output_uses_mounted_dir() {
+        let host_path = get_default_docker_snapshot_output_path(Path::new("/data/hl"));
+        assert_eq!(host_path, PathBuf::from("/data/hl/hyperliquid_data/orderbook_snapshot.json"));
+        assert_eq!(
+            docker_container_path(&host_path, Path::new("/data/hl")),
+            PathBuf::from("hl/hyperliquid_data/orderbook_snapshot.json")
         );
     }
 

@@ -134,7 +134,7 @@ The handoff from snapshot to live stream is **gapless**: at startup the server b
 | `--hlnode-binary` | `hl-node` | Path to hl-node binary on host (direct mode only) |
 | `--data-dir` | `~` | Path to the folder containing `node_fills_streaming/`, `node_order_statuses_streaming/`, and `node_raw_book_diffs_streaming/`. This is where the node writes its real-time event files |
 | `--abci-state-path` | auto | Path to an ABCI state `.rmp` file. Auto-detects the newest file under `<data-dir>/periodic_abci_states/` first, then falls back to `<parent-of-data-dir>/hyperliquid_data/abci_state.rmp`. Override if your node stores state in a non-standard location |
-| `--snapshot-output-path` | auto | Path where `hl-node` writes its JSON snapshot output. Defaults to `/tmp/hl_snapshot.json`. Override if `/tmp` is not writable or you want snapshots stored elsewhere |
+| `--snapshot-output-path` | auto | Path where `hl-node` writes its JSON snapshot output. Defaults to `/tmp/hl_snapshot.json` in direct mode and `<parent-of-data-dir>/hyperliquid_data/orderbook_snapshot.json` in docker mode. Override if the default path is not writable or you want snapshots stored elsewhere |
 | `--visor-state-path` | auto | Path to `visor_abci_state.json`, which contains the current block height. Auto-detected relative to `--data-dir`. Override if your visor state is in a non-standard location |
 
 ### Market Types
