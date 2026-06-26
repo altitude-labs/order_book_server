@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use clap::ValueEnum;
 
 pub use prelude::Result;
-pub use servers::websocket_server::run_websocket_server;
+pub use servers::websocket_server::{run_websocket_server, run_websocket_transport};
 
 /// Snapshot fetching mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]

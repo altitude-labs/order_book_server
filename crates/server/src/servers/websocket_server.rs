@@ -1,7 +1,6 @@
 use crate::{
     listeners::order_book::{
-        ActiveL2Params, CoinBbo, InternalMessage, L2FrameCache, L2FrameKey, L2ParamGuard, L2SnapshotParams,
-        OrderBookListener, hl_listen_hft,
+        CoinBbo, InternalMessage, L2FrameCache, L2FrameKey, L2ParamGuard, L2SnapshotParams, OrderBookListener,
     },
     metrics::{
         BBO_CHANGES_TOTAL, BROADCAST_RECEIVERS, BROADCASTS_TOTAL, CHANNEL_DROPS_TOTAL, CHANNEL_LAG,
@@ -9,6 +8,7 @@ use crate::{
     },
     order_book::{Coin, Snapshot},
     prelude::*,
+    transport::{ActiveL2Params, OrderBookRuntime},
     types::{
         Bbo, L2Book, L4Book, L4BookUpdates, L4Order,
         inner::InnerLevel,
@@ -24,13 +24,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::select;
-use tokio::{
-    net::TcpListener,
-    sync::{
-        Mutex,
-        broadcast::{Sender, channel},
-    },
-};
+use tokio::{net::TcpListener, sync::Mutex, sync::broadcast::Sender};
 use yawc::{FrameView, OpCode, WebSocket};
 
 use crate::ServerConfig;
@@ -92,58 +86,19 @@ async fn heartbeat_tick(ticker: &mut Option<tokio::time::Interval>) {
 }
 
 pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
-    // One channel multiplexes every event (L2/BBO/L4/fills) to all connections.
-    // In `--stream-with-block-info` mode the listener emits one message per node
-    // event (order statuses/diffs: thousands/s), so depth 32 drained in
-    // milliseconds and any consumer jitter tripped `RecvError::Lagged`, evicting
-    // messages across all channels. Even with batch draining and shared frames,
-    // a single trades subscriber lost ~71% of trades on a busy mainnet window at
-    // depth 32 vs ~1.7% at 16384, in the same conditions. 16384 gives seconds of
-    // headroom; each slot is one Arc pointer and a persistently-slow consumer
-    // still sheds via Lagged, so memory stays bounded.
-    // TODO: this is a mitigation, not a fix — loss is still cross-channel
-    // (residual ~1.7% above) and every connection is woken for the full L4
-    // firehose. Splitting into per-message-type channels, subscribed per
-    // connection as needed, would decouple loss domains and wakeup cost.
-    let (internal_message_tx, _) = channel::<Arc<InternalMessage>>(16384);
+    let runtime = OrderBookRuntime::spawn(&config);
+    run_websocket_transport(config, runtime).await
+}
 
-    // Market filter flags from config
-    let market_filter = (config.include_perps, config.include_spot, config.include_hip3);
-    let ignore_spot = !config.include_spot; // For OrderBookListener (legacy)
+pub async fn run_websocket_transport(config: ServerConfig, runtime: OrderBookRuntime) -> Result<()> {
+    let internal_message_tx = runtime.internal_message_tx();
+    let listener = runtime.listener();
     let compression_level = config.compression_level;
-
-    // Shared registry of L2 variant shapes any live connection wants. Cloned into
-    // the listener (read at flush time) and handed to each connection (which
-    // acquires/releases refcounted guards on subscribe/unsubscribe + disconnect).
-    let active_l2_params = ActiveL2Params::new();
-
-    // Resolve data directory
-    // Central task: listen to messages and forward them for distribution
-    let listener = {
-        let internal_message_tx = internal_message_tx.clone();
-        let mut listener =
-            OrderBookListener::new(Some(internal_message_tx), ignore_spot, active_l2_params.clone(), market_filter);
-        listener.set_tolerate_drift(config.no_resync);
-        listener
-    };
-    let listener = Arc::new(Mutex::new(listener));
-    let listener_task = {
-        let listener = listener.clone();
-        let config = config.clone();
-        tokio::spawn(async move {
-            info!("Starting HFT-optimized listener");
-            let result = hl_listen_hft(listener, config).await;
-            if let Err(err) = result {
-                error!("Listener fatal error: {err}");
-                std::process::exit(1);
-            }
-        })
-    };
 
     let websocket_opts =
         yawc::Options::default().with_compression_level(yawc::CompressionLevel::new(compression_level));
 
-    let start_time = Instant::now();
+    let start_time = runtime.start_time();
     let listener_for_health = listener.clone();
 
     let app: Router = Router::new()
@@ -151,9 +106,9 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
             "/ws",
             get({
                 let internal_message_tx = internal_message_tx.clone();
-                let bbo_only = config.bbo_only;
-                let l2book_heartbeat_ms = config.l2book_heartbeat_ms;
-                let bbo_heartbeat_ms = config.bbo_heartbeat_ms;
+                let bbo_only = runtime.bbo_only();
+                let l2book_heartbeat_ms = runtime.l2book_heartbeat_ms();
+                let bbo_heartbeat_ms = runtime.bbo_heartbeat_ms();
                 let listener = listener.clone();
                 move |ws_upgrade| async move {
                     ws_handler(
@@ -192,22 +147,7 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
     let tcp_listener = TcpListener::bind(&config.address).await?;
     info!("WebSocket server running at ws://{}", config.address);
 
-    tokio::select! {
-        result = axum::serve(NoDelayListener(tcp_listener), app) => {
-            if let Err(err) = result {
-                error!("Server fatal error: {err}");
-                std::process::exit(2);
-            }
-        }
-        // hl_listen_hft loops forever and exits the process itself on a fatal
-        // Err; reaching this arm means the task panicked or was aborted. The
-        // old fire-and-forget spawn left the server up with a dead feed.
-        join = listener_task => {
-            error!("Listener task exited unexpectedly: {join:?}");
-            std::process::exit(1);
-        }
-    }
-
+    axum::serve(NoDelayListener(tcp_listener), app).await?;
     Ok(())
 }
 

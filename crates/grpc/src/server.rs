@@ -6,7 +6,7 @@ use server::{
     transport::{
         ActiveL2Params, ClientMessage, Coin, CoinBbo, CoinStatuses, DEFAULT_LEVELS, InnerLevel, InternalMessage,
         L2ParamGuard, L2SnapshotParams, L4Order, Level, MAX_LEVELS, NodeDataOrderDiff, NodeDataOrderStatus,
-        OrderBookListener, OrderDiff, Side, Snapshot, Subscription, SubscriptionManager, Trade, hl_listen_hft,
+        OrderBookListener, OrderBookRuntime, OrderDiff, Side, Snapshot, Subscription, SubscriptionManager, Trade,
     },
 };
 use std::{
@@ -20,11 +20,7 @@ use std::{
 };
 use tokio::{
     select,
-    sync::{
-        Mutex,
-        broadcast::{Sender, channel},
-        mpsc,
-    },
+    sync::{Mutex, broadcast::Sender, mpsc},
 };
 use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, transport::Server};
@@ -65,41 +61,19 @@ async fn heartbeat_tick(ticker: &mut Option<tokio::time::Interval>) {
 }
 
 pub async fn run_grpc_server(config: ServerConfig) -> Result<()> {
-    let (internal_message_tx, _) = channel::<Arc<InternalMessage>>(16384);
+    let runtime = OrderBookRuntime::spawn(&config);
+    run_grpc_transport(config, runtime).await
+}
 
-    let market_filter = (config.include_perps, config.include_spot, config.include_hip3);
-    let ignore_spot = !config.include_spot;
-    let active_l2_params = ActiveL2Params::new();
-
-    let listener = {
-        let internal_message_tx = internal_message_tx.clone();
-        let mut listener =
-            OrderBookListener::new(Some(internal_message_tx), ignore_spot, active_l2_params, market_filter);
-        listener.set_tolerate_drift(config.no_resync);
-        listener
-    };
-    let listener = Arc::new(Mutex::new(listener));
-    let listener_task = {
-        let listener = listener.clone();
-        let config = config.clone();
-        tokio::spawn(async move {
-            info!("Starting HFT-optimized listener");
-            let result = hl_listen_hft(listener, config).await;
-            if let Err(err) = result {
-                error!("Listener fatal error: {err}");
-                std::process::exit(1);
-            }
-        })
-    };
-
+pub async fn run_grpc_transport(config: ServerConfig, runtime: OrderBookRuntime) -> Result<()> {
     let addr = config.address.parse()?;
     let service = GrpcOrderbookService {
-        internal_message_tx,
-        listener,
-        bbo_only: config.bbo_only,
-        l2book_heartbeat_ms: config.l2book_heartbeat_ms,
-        bbo_heartbeat_ms: config.bbo_heartbeat_ms,
-        start_time: Instant::now(),
+        internal_message_tx: runtime.internal_message_tx(),
+        listener: runtime.listener(),
+        bbo_only: runtime.bbo_only(),
+        l2book_heartbeat_ms: runtime.l2book_heartbeat_ms(),
+        bbo_heartbeat_ms: runtime.bbo_heartbeat_ms(),
+        start_time: runtime.start_time(),
         active_connections: Arc::new(AtomicU64::new(0)),
     };
 
@@ -109,19 +83,7 @@ pub async fn run_grpc_server(config: ServerConfig) -> Result<()> {
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter.set_serving::<pb::orderbook_server::OrderbookServer<GrpcOrderbookService>>().await;
 
-    tokio::select! {
-        result = Server::builder().tcp_nodelay(true).add_service(health_service).add_service(orderbook_service).serve(addr) => {
-            if let Err(err) = result {
-                error!("gRPC server fatal error: {err}");
-                std::process::exit(2);
-            }
-        }
-        join = listener_task => {
-            error!("Listener task exited unexpectedly: {join:?}");
-            std::process::exit(1);
-        }
-    }
-
+    Server::builder().tcp_nodelay(true).add_service(health_service).add_service(orderbook_service).serve(addr).await?;
     Ok(())
 }
 

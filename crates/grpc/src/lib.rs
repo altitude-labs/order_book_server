@@ -5,4 +5,4 @@ pub mod orderbook {
 
 mod server;
 
-pub use server::run_grpc_server;
+pub use server::{run_grpc_server, run_grpc_transport};
