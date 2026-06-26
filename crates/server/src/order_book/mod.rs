@@ -9,7 +9,8 @@ pub(crate) mod multi_book;
 mod price_level;
 pub(crate) mod types;
 
-pub(crate) use types::{Coin, InnerOrder, Oid, Px, Side, Sz};
+pub(crate) use types::{Coin, Side};
+pub(crate) use types::{InnerOrder, Oid, Px, Sz};
 
 #[derive(Clone, Default)]
 pub(crate) struct OrderBook<O> {
@@ -19,20 +20,21 @@ pub(crate) struct OrderBook<O> {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Snapshot<O>([Vec<O>; 2]);
+pub struct Snapshot<O>([Vec<O>; 2]);
 
 impl<O: Clone> Snapshot<O> {
-    pub(crate) const fn as_ref(&self) -> &[Vec<O>; 2] {
+    pub const fn as_ref(&self) -> &[Vec<O>; 2] {
         &self.0
     }
 
-    pub(crate) fn truncate(&self, n: usize) -> Self {
+    pub fn truncate(&self, n: usize) -> Self {
         // Clone only the first n entries per side; the previous full-Vec clone
         // copied up to MAX_LEVELS entries just to drop most of them.
         Self(self.0.each_ref().map(|orders| orders.iter().take(n).cloned().collect_vec()))
     }
 }
 
+#[allow(private_bounds)]
 impl<O: InnerOrder> Snapshot<O> {
     pub(crate) fn remove_triggers(&mut self) {
         #[allow(clippy::unwrap_used)]
@@ -792,9 +794,6 @@ mod tests {
         let elapsed = start.elapsed();
         let per_call = elapsed / iterations;
 
-        eprintln!(
-            "[PERF] L4 from_snapshot (1000 orders): {iterations} calls in {:?} ({:?}/call)",
-            elapsed, per_call
-        );
+        eprintln!("[PERF] L4 from_snapshot (1000 orders): {iterations} calls in {:?} ({:?}/call)", elapsed, per_call);
     }
 }

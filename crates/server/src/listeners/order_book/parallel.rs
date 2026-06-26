@@ -364,7 +364,10 @@ impl FileReader {
                                         if count % 10_000 == 0 {
                                             log::debug!(
                                                 "on_modify #{}: read {} bytes, {} lines, ends_newline={}",
-                                                count, bytes_read, line_count, ends_newline
+                                                count,
+                                                bytes_read,
+                                                line_count,
+                                                ends_newline
                                             );
                                         }
 
@@ -845,7 +848,10 @@ mod tests {
 
     #[test]
     fn test_extract_block_number() {
-        assert_eq!(extract_block_number(r#"{"local_time":"t","block_time":"t","block_number":123,"events":[]}"#), Some(123));
+        assert_eq!(
+            extract_block_number(r#"{"local_time":"t","block_time":"t","block_number":123,"events":[]}"#),
+            Some(123)
+        );
         assert_eq!(extract_block_number(r#"{"block_number": 7}"#), Some(7), "whitespace after the colon is fine");
         assert_eq!(extract_block_number(r#"{"height":9}"#), None);
         assert_eq!(extract_block_number(r#"{"block_number":"x"}"#), None);

@@ -82,7 +82,8 @@ cp /path/to/hl-node /usr/local/bin/ob-snapshotter
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--address` | `0.0.0.0` | Bind address |
-| `--port` | `8000` | WebSocket port |
+| `--port` | `8000` | Transport port |
+| `--transport` | `websocket` | Transport to run: `websocket` or `grpc`. `grpc` requires building with `--features grpc` |
 | `--compression-level` | `1` | WebSocket compression level (0-9). See [Compression](#compression) |
 | `--markets` | `all` | `perps`, `spot`, `hip3`, `all` |
 | `--log-level` | `info` | `error`, `warn`, `info`, `debug`, `trace` |
@@ -99,6 +100,21 @@ WebSocket messages (especially L2/L4 snapshots) can be large. The `--compression
 | `9` | Best ratio | Maximum compression. Higher CPU cost, useful for bandwidth-constrained links |
 
 Your WebSocket client must support `permessage-deflate` for levels 1-9 to have any effect. If it doesn't, use `0`.
+
+### gRPC Transport
+
+The default transport is WebSocket. To run the gRPC server instead:
+
+```bash
+cargo build --release --features grpc
+./target/release/orderbook_server \
+    --transport grpc \
+    --address 0.0.0.0 \
+    --port 8000 \
+    --data-dir /path/to/data
+```
+
+The gRPC service is defined in `crates/grpc/proto/orderbook.proto`. Its stream uses typed protobuf request and response messages for subscriptions, BBO, L2 books, L4 books, trades, book diffs, and order updates.
 
 ### Snapshot Mode
 

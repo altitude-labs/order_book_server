@@ -12,7 +12,7 @@ use crate::{
 
 // L4Order: the struct we keep in the orderbook (computationally better)
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct InnerL4Order {
+pub struct InnerL4Order {
     pub user: Address,
     pub coin: Coin,
     pub side: Side,
@@ -173,7 +173,7 @@ impl TryFrom<NodeDataOrderStatus> for InnerL4Order {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct InnerLevel {
+pub struct InnerLevel {
     pub px: Px,
     pub sz: Sz,
     pub n: usize,
@@ -377,11 +377,8 @@ mod tests {
 
     #[test]
     fn test_inner_level_to_level() {
-        let inner = InnerLevel {
-            px: Px::parse_from_str("100.5").unwrap(),
-            sz: Sz::parse_from_str("2.5").unwrap(),
-            n: 3,
-        };
+        let inner =
+            InnerLevel { px: Px::parse_from_str("100.5").unwrap(), sz: Sz::parse_from_str("2.5").unwrap(), n: 3 };
         let level: Level = inner.into();
         assert_eq!(level.px(), "100.5");
         assert_eq!(level.sz(), "2.5");

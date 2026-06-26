@@ -1,0 +1,209 @@
+syntax = "proto3";
+
+package orderbook.v1;
+
+service Orderbook {
+  rpc Stream(stream ClientMessage) returns (stream ServerMessage);
+  rpc Ping(.orderbook.v1.Ping) returns (.orderbook.v1.Pong);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message Ping {}
+message Pong {}
+message Error {
+  string message = 1;
+}
+
+message ClientMessage {
+  oneof message {
+    Subscription subscribe = 1;
+    Subscription unsubscribe = 2;
+    Ping ping = 3;
+  }
+}
+
+message ServerMessage {
+  oneof message {
+    ClientMessage subscription_response = 1;
+    L2Book l2_book = 2;
+    L4Book l4_book = 3;
+    Trades trades = 4;
+    Bbo bbo = 5;
+    BookDiffs book_diffs = 6;
+    OrderUpdates order_updates = 7;
+    Pong pong = 8;
+    Error error = 9;
+  }
+}
+
+message Subscription {
+  oneof subscription {
+    CoinSubscription trades = 1;
+    L2BookSubscription l2_book = 2;
+    CoinSubscription l4_book = 3;
+    CoinSubscription bbo = 4;
+    UserSubscription order_updates = 5;
+    CoinSubscription book_diffs = 6;
+  }
+}
+
+message CoinSubscription {
+  string coin = 1;
+}
+
+message UserSubscription {
+  string user = 1;
+}
+
+message L2BookSubscription {
+  string coin = 1;
+  optional uint32 n_sig_figs = 2;
+  optional uint64 mantissa = 3;
+  optional uint64 n_levels = 4;
+}
+
+enum Side {
+  SIDE_UNSPECIFIED = 0;
+  ASK = 1;
+  BID = 2;
+}
+
+message Level {
+  string px = 1;
+  string sz = 2;
+  uint64 n = 3;
+}
+
+message L2Book {
+  string coin = 1;
+  uint64 time = 2;
+  optional uint32 n_sig_figs = 3;
+  optional uint64 mantissa = 4;
+  optional uint64 n_levels = 5;
+  repeated Level bids = 6;
+  repeated Level asks = 7;
+}
+
+message Bbo {
+  string coin = 1;
+  uint64 time = 2;
+  optional Level bid = 3;
+  optional Level ask = 4;
+}
+
+message L4Book {
+  oneof payload {
+    L4BookSnapshot snapshot = 1;
+    L4BookUpdates updates = 2;
+  }
+}
+
+message L4BookSnapshot {
+  string coin = 1;
+  uint64 time = 2;
+  uint64 height = 3;
+  repeated L4Order bids = 4;
+  repeated L4Order asks = 5;
+}
+
+message L4BookUpdates {
+  uint64 time = 1;
+  uint64 height = 2;
+  repeated OrderStatus order_statuses = 3;
+  repeated OrderDiffEvent book_diffs = 4;
+}
+
+message L4Order {
+  optional string user = 1;
+  string coin = 2;
+  Side side = 3;
+  string limit_px = 4;
+  string sz = 5;
+  uint64 oid = 6;
+  uint64 timestamp = 7;
+  string trigger_condition = 8;
+  bool is_trigger = 9;
+  string trigger_px = 10;
+  repeated string children_json = 11;
+  bool is_position_tpsl = 12;
+  bool reduce_only = 13;
+  string order_type = 14;
+  string orig_sz = 15;
+  optional string tif = 16;
+  optional string cloid = 17;
+}
+
+message OrderStatus {
+  string time = 1;
+  string user = 2;
+  optional string hash = 3;
+  optional string builder_json = 4;
+  string status = 5;
+  L4Order order = 6;
+}
+
+message OrderDiffEvent {
+  string user = 1;
+  uint64 oid = 2;
+  string px = 3;
+  string coin = 4;
+  OrderDiff raw_book_diff = 5;
+}
+
+message OrderDiff {
+  oneof diff {
+    NewOrderDiff new = 1;
+    UpdateOrderDiff update = 2;
+    RemoveOrderDiff remove = 3;
+  }
+}
+
+message NewOrderDiff {
+  string sz = 1;
+}
+
+message UpdateOrderDiff {
+  string orig_sz = 1;
+  string new_sz = 2;
+}
+
+message RemoveOrderDiff {}
+
+message Trade {
+  string coin = 1;
+  Side side = 2;
+  string px = 3;
+  string sz = 4;
+  string hash = 5;
+  uint64 time = 6;
+  uint64 tid = 7;
+  repeated string users = 8;
+}
+
+message Trades {
+  repeated Trade trades = 1;
+}
+
+message BookDiffs {
+  repeated OrderDiffEvent book_diffs = 1;
+}
+
+message OrderUpdate {
+  string user = 1;
+  uint64 time = 2;
+  uint64 height = 3;
+  OrderStatus order_status = 4;
+}
+
+message OrderUpdates {
+  repeated OrderUpdate order_updates = 1;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;
+  uint64 uptime_seconds = 2;
+  uint64 height = 3;
+  uint64 connections = 4;
+}

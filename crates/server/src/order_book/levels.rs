@@ -47,7 +47,7 @@ impl Snapshot<InnerLevel> {
         Self([bids, asks])
     }
 
-    pub(crate) fn export_inner_snapshot(self) -> [Vec<Level>; 2] {
+    pub fn export_inner_snapshot(self) -> [Vec<Level>; 2] {
         self.0.map(|b| b.into_iter().map(Level::from).collect())
     }
 }
@@ -151,20 +151,34 @@ mod tests {
     }
 
     impl InnerOrder for TestOrder {
-        fn oid(&self) -> crate::order_book::Oid { crate::order_book::Oid::new(self.oid) }
-        fn side(&self) -> Side { self.side }
-        fn limit_px(&self) -> Px { Px::new(self.limit_px) }
-        fn sz(&self) -> Sz { Sz::new(self.sz) }
-        fn decrement_sz(&mut self, dec: Sz) { self.sz = self.sz.saturating_sub(dec.value()); }
+        fn oid(&self) -> crate::order_book::Oid {
+            crate::order_book::Oid::new(self.oid)
+        }
+        fn side(&self) -> Side {
+            self.side
+        }
+        fn limit_px(&self) -> Px {
+            Px::new(self.limit_px)
+        }
+        fn sz(&self) -> Sz {
+            Sz::new(self.sz)
+        }
+        fn decrement_sz(&mut self, dec: Sz) {
+            self.sz = self.sz.saturating_sub(dec.value());
+        }
         fn fill(&mut self, maker: &mut Self) -> Sz {
             let m = self.sz().min(maker.sz());
             self.decrement_sz(m);
             maker.decrement_sz(m);
             m
         }
-        fn modify_sz(&mut self, sz: Sz) { self.sz = sz.value(); }
+        fn modify_sz(&mut self, sz: Sz) {
+            self.sz = sz.value();
+        }
         fn convert_trigger(&mut self, _: u64) {}
-        fn coin(&self) -> crate::order_book::Coin { crate::order_book::Coin::new("") }
+        fn coin(&self) -> crate::order_book::Coin {
+            crate::order_book::Coin::new("")
+        }
     }
 
     fn make_book(bids: &[(u64, u64, u64)], asks: &[(u64, u64, u64)]) -> OrderBook<TestOrder> {
@@ -191,10 +205,7 @@ mod tests {
 
     #[test]
     fn test_l2_no_aggregation() {
-        let book = make_book(
-            &[(500, 100, 2), (400, 200, 1)],
-            &[(600, 150, 1), (700, 300, 1)],
-        );
+        let book = make_book(&[(500, 100, 2), (400, 200, 1)], &[(600, 150, 1), (700, 300, 1)]);
         let snapshot = book.to_l2_snapshot(None, None, None);
         let [bids, asks] = to_levels(snapshot);
         assert_eq!(bids, vec![(500, 200, 2), (400, 200, 1)]);
@@ -203,10 +214,8 @@ mod tests {
 
     #[test]
     fn test_l2_n_levels_truncation() {
-        let book = make_book(
-            &[(500, 100, 1), (400, 100, 1), (300, 100, 1)],
-            &[(600, 100, 1), (700, 100, 1), (800, 100, 1)],
-        );
+        let book =
+            make_book(&[(500, 100, 1), (400, 100, 1), (300, 100, 1)], &[(600, 100, 1), (700, 100, 1), (800, 100, 1)]);
         let snapshot = book.to_l2_snapshot(Some(2), None, None);
         let [bids, asks] = to_levels(snapshot);
         assert_eq!(bids.len(), 2);
@@ -264,10 +273,8 @@ mod tests {
 
     #[test]
     fn test_l2_from_l2_matches_l2_from_l4() {
-        let book = make_book(
-            &[(500, 100, 3), (490, 200, 2), (480, 50, 1)],
-            &[(510, 100, 2), (520, 200, 1), (530, 50, 1)],
-        );
+        let book =
+            make_book(&[(500, 100, 3), (490, 200, 2), (480, 50, 1)], &[(510, 100, 2), (520, 200, 1), (530, 50, 1)]);
         let raw_l2 = book.to_l2_snapshot(None, None, None);
         let from_l4 = book.to_l2_snapshot(Some(2), Some(2), None);
         let from_l2 = raw_l2.to_l2_snapshot(Some(2), Some(2), None);

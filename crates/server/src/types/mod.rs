@@ -11,7 +11,7 @@ pub(crate) mod node_data;
 pub(crate) mod subscription;
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct Trade {
+pub struct Trade {
     pub coin: String,
     side: Side,
     px: String,
@@ -23,26 +23,27 @@ pub(crate) struct Trade {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
-pub(crate) struct Level {
+pub struct Level {
     px: String,
     sz: String,
     n: usize,
 }
 
 impl Level {
-    pub(crate) const fn new(px: String, sz: String, n: usize) -> Self {
+    pub const fn new(px: String, sz: String, n: usize) -> Self {
         Self { px, sz, n }
     }
 
-    // Only exercised by tests since the BBO snapshot path moved to numeric dedup.
-    #[cfg(test)]
-    pub(crate) fn px(&self) -> &str {
+    pub fn px(&self) -> &str {
         &self.px
     }
 
-    #[cfg(test)]
-    pub(crate) fn sz(&self) -> &str {
+    pub fn sz(&self) -> &str {
         &self.sz
+    }
+
+    pub const fn n(&self) -> usize {
+        self.n
     }
 }
 
@@ -124,6 +125,38 @@ impl Trade {
             users: [buyer, seller],
         })
     }
+
+    pub fn coin(&self) -> &str {
+        &self.coin
+    }
+
+    pub const fn side(&self) -> Side {
+        self.side
+    }
+
+    pub fn px(&self) -> &str {
+        &self.px
+    }
+
+    pub fn sz(&self) -> &str {
+        &self.sz
+    }
+
+    pub fn hash(&self) -> &str {
+        &self.hash
+    }
+
+    pub const fn time(&self) -> u64 {
+        self.time
+    }
+
+    pub const fn tid(&self) -> u64 {
+        self.tid
+    }
+
+    pub const fn users(&self) -> [Address; 2] {
+        self.users
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -140,7 +173,7 @@ pub(crate) struct L4BookUpdates {
 // RawL4Order is the version of a L4Order we want to serialize and deserialize directly
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct L4Order {
+pub struct L4Order {
     // when serializing, this field is found outside of this struct
     // when deserializing, we move it into this struct
     pub user: Option<Address>,
@@ -166,7 +199,7 @@ pub(crate) struct L4Order {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum OrderDiff {
+pub enum OrderDiff {
     #[serde(rename_all = "camelCase")]
     New {
         sz: String,

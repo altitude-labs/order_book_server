@@ -4,7 +4,7 @@ use std::fmt::{Debug, Formatter};
 use std::ops::Add;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub(crate) enum Side {
+pub enum Side {
     #[serde(rename = "A")]
     Ask,
     #[serde(rename = "B")]
@@ -15,13 +15,13 @@ pub(crate) enum Side {
 pub(crate) struct Oid(u64);
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct Px(u64);
+pub struct Px(u64);
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct Sz(u64);
+pub struct Sz(u64);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct Coin(String);
+pub struct Coin(String);
 
 impl Sz {
     pub(crate) const fn new(value: u64) -> Self {
@@ -33,7 +33,7 @@ impl Sz {
     pub(super) const fn is_zero(self) -> bool {
         self.0 == 0
     }
-    pub(crate) const fn value(self) -> u64 {
+    pub const fn value(self) -> u64 {
         self.0
     }
     pub(crate) const fn decrement_sz(&mut self, dec: u64) {
@@ -45,7 +45,7 @@ impl Px {
     pub(crate) const fn new(value: u64) -> Self {
         Self(value)
     }
-    pub(crate) const fn value(self) -> u64 {
+    pub const fn value(self) -> u64 {
         self.0
     }
 }
@@ -69,11 +69,11 @@ pub(crate) trait InnerOrder: Clone {
 }
 
 impl Coin {
-    pub(crate) fn new(coin: &str) -> Self {
+    pub fn new(coin: &str) -> Self {
         Self(coin.to_string())
     }
 
-    pub(crate) fn value(&self) -> String {
+    pub fn value(&self) -> String {
         self.0.clone()
     }
 
@@ -154,7 +154,7 @@ impl Px {
     }
 
     #[must_use]
-    pub(crate) fn to_str(self) -> String {
+    pub fn to_str(self) -> String {
         let s = format!("{:.8}", (self.value() as f64) / MULTIPLIER);
         let s = s.trim_end_matches('0');
         s.trim_end_matches('.').to_string()
@@ -173,7 +173,7 @@ impl Sz {
     }
 
     #[must_use]
-    pub(crate) fn to_str(self) -> String {
+    pub fn to_str(self) -> String {
         let s = format!("{:.8}", (self.value() as f64) / MULTIPLIER);
         let s = s.trim_end_matches('0');
         s.trim_end_matches('.').to_string()

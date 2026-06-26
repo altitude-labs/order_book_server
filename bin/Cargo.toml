@@ -1,17 +1,32 @@
 [package]
 name = "orderbook-server"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 publish = false
 
 [dependencies]
-server = { path = "../server" }
-env_logger = "0.11.8"
-tokio = { version = "1", features = ["full"] }
-clap = { version = "4.5.42", features = ["derive"] }
-axum = "0.8.4"
-log = "0.4"
-mimalloc = "0.1"
+axum.workspace = true
+clap.workspace = true
+env_logger.workspace = true
+futures-util.workspace = true
+grpc = { workspace = true, optional = true }
+log.workspace = true
+mimalloc.workspace = true
+serde_json.workspace = true
+server.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tokio-tungstenite.workspace = true
+tonic.workspace = true
+
+[features]
+default = []
+grpc = ["dep:grpc"]
+
+[[bin]]
+name = "compare_ws_grpc_latency"
+path = "src/bin/compare_ws_grpc_latency.rs"
+required-features = ["grpc"]
 
 [lints]
 workspace = true

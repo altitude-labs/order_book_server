@@ -6,8 +6,8 @@ use log::debug;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-pub(crate) const MAX_LEVELS: usize = 100;
-pub(crate) const DEFAULT_LEVELS: usize = 20;
+pub const MAX_LEVELS: usize = 100;
+pub const DEFAULT_LEVELS: usize = 20;
 /// Hard cap on subscriptions per WS connection. The broadcast hot paths iterate
 /// every subscription on every event, and L4Book subscribes also trigger a
 /// listener-lock-held snapshot computation - one client with thousands of subs
@@ -18,7 +18,7 @@ pub(crate) const MAX_SUBSCRIPTIONS_PER_CONNECTION: usize = 256;
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method")]
 #[serde(rename_all = "camelCase")]
-pub(crate) enum ClientMessage {
+pub enum ClientMessage {
     Subscribe { subscription: Subscription },
     Unsubscribe { subscription: Subscription },
     Ping,
@@ -27,7 +27,7 @@ pub(crate) enum ClientMessage {
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "camelCase")]
-pub(crate) enum Subscription {
+pub enum Subscription {
     #[serde(rename_all = "camelCase")]
     Trades { coin: String },
     #[serde(rename_all = "camelCase")]
@@ -43,7 +43,7 @@ pub(crate) enum Subscription {
 }
 
 impl Subscription {
-    pub(crate) fn validate(&self, universe: &HashSet<String>) -> bool {
+    pub fn validate(&self, universe: &HashSet<String>) -> bool {
         match self {
             Self::Trades { coin } => universe.contains(coin),
             Self::L2Book { coin, n_sig_figs, n_levels, mantissa } => {
@@ -103,7 +103,7 @@ impl Subscription {
 }
 
 impl Subscription {
-    pub(crate) const fn type_label(&self) -> &str {
+    pub const fn type_label(&self) -> &str {
         match self {
             Self::Bbo { .. } => "bbo",
             Self::L2Book { .. } => "l2Book",
@@ -147,14 +147,14 @@ pub(crate) enum ServerResponse {
 }
 
 #[derive(Default)]
-pub(crate) struct SubscriptionManager {
+pub struct SubscriptionManager {
     subscriptions: HashSet<Subscription>,
 }
 
 impl SubscriptionManager {
     /// Tries to add the subscription. Returns `Err` once the per-connection cap
     /// is reached, distinguishing "already subscribed" (Ok(false)) from "limit hit".
-    pub(crate) fn subscribe(&mut self, sub: Subscription) -> Result<bool, &'static str> {
+    pub fn subscribe(&mut self, sub: Subscription) -> Result<bool, &'static str> {
         if self.subscriptions.len() >= MAX_SUBSCRIPTIONS_PER_CONNECTION && !self.subscriptions.contains(&sub) {
             return Err("subscription limit reached for this connection");
         }
@@ -166,7 +166,7 @@ impl SubscriptionManager {
         Ok(inserted)
     }
 
-    pub(crate) fn unsubscribe(&mut self, sub: Subscription) -> bool {
+    pub fn unsubscribe(&mut self, sub: Subscription) -> bool {
         let label = sub.type_label().to_owned();
         let removed = self.subscriptions.remove(&sub);
         if removed {
@@ -175,7 +175,7 @@ impl SubscriptionManager {
         removed
     }
 
-    pub(crate) const fn subscriptions(&self) -> &HashSet<Subscription> {
+    pub const fn subscriptions(&self) -> &HashSet<Subscription> {
         &self.subscriptions
     }
 }
@@ -326,26 +326,30 @@ mod test {
     #[test]
     fn test_validate_l2book_n_levels_at_default_rejected() {
         // Setting n_levels to DEFAULT_LEVELS (20) explicitly is rejected
-        let sub = Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: None, n_levels: Some(20), mantissa: None };
+        let sub =
+            Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: None, n_levels: Some(20), mantissa: None };
         assert!(!sub.validate(&universe()));
     }
 
     #[test]
     fn test_validate_l2book_n_levels_over_max() {
-        let sub = Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: None, n_levels: Some(101), mantissa: None };
+        let sub =
+            Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: None, n_levels: Some(101), mantissa: None };
         assert!(!sub.validate(&universe()));
     }
 
     #[test]
     fn test_validate_l2book_n_levels_at_max() {
-        let sub = Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: None, n_levels: Some(100), mantissa: None };
+        let sub =
+            Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: None, n_levels: Some(100), mantissa: None };
         assert!(sub.validate(&universe()));
     }
 
     #[test]
     fn test_validate_l2book_sig_figs_valid_range() {
         for sf in 2..=5 {
-            let sub = Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: Some(sf), n_levels: None, mantissa: None };
+            let sub =
+                Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: Some(sf), n_levels: None, mantissa: None };
             assert!(sub.validate(&universe()), "sig_figs={sf} should be valid");
         }
     }
@@ -353,7 +357,8 @@ mod test {
     #[test]
     fn test_validate_l2book_sig_figs_out_of_range() {
         for sf in [0, 1, 6, 10] {
-            let sub = Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: Some(sf), n_levels: None, mantissa: None };
+            let sub =
+                Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: Some(sf), n_levels: None, mantissa: None };
             assert!(!sub.validate(&universe()), "sig_figs={sf} should be invalid");
         }
     }
@@ -367,20 +372,27 @@ mod test {
     #[test]
     fn test_validate_l2book_mantissa_valid_with_sig_figs_5() {
         for m in [2, 5] {
-            let sub = Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: Some(5), n_levels: None, mantissa: Some(m) };
+            let sub = Subscription::L2Book {
+                coin: "BTC".to_string(),
+                n_sig_figs: Some(5),
+                n_levels: None,
+                mantissa: Some(m),
+            };
             assert!(sub.validate(&universe()), "mantissa={m} with sig_figs=5 should be valid");
         }
     }
 
     #[test]
     fn test_validate_l2book_mantissa_invalid_value() {
-        let sub = Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: Some(5), n_levels: None, mantissa: Some(3) };
+        let sub =
+            Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: Some(5), n_levels: None, mantissa: Some(3) };
         assert!(!sub.validate(&universe()));
     }
 
     #[test]
     fn test_validate_l2book_mantissa_invalid_with_low_sig_figs() {
-        let sub = Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: Some(3), n_levels: None, mantissa: Some(5) };
+        let sub =
+            Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: Some(3), n_levels: None, mantissa: Some(5) };
         assert!(!sub.validate(&universe()));
     }
 
@@ -413,7 +425,11 @@ mod test {
     #[test]
     fn test_type_labels() {
         assert_eq!(Subscription::Bbo { coin: "".to_string() }.type_label(), "bbo");
-        assert_eq!(Subscription::L2Book { coin: "".to_string(), n_sig_figs: None, n_levels: None, mantissa: None }.type_label(), "l2Book");
+        assert_eq!(
+            Subscription::L2Book { coin: "".to_string(), n_sig_figs: None, n_levels: None, mantissa: None }
+                .type_label(),
+            "l2Book"
+        );
         assert_eq!(Subscription::L4Book { coin: "".to_string() }.type_label(), "l4Book");
         assert_eq!(Subscription::Trades { coin: "".to_string() }.type_label(), "trades");
         assert_eq!(Subscription::OrderUpdates { user: "".to_string() }.type_label(), "orderUpdates");
@@ -512,7 +528,10 @@ mod test {
             (r#"{"method":"subscribe","subscription":{"type":"l4Book","coin":"BTC"}}"#, "l4Book"),
             (r#"{"method":"subscribe","subscription":{"type":"bookDiffs","coin":"BTC"}}"#, "bookDiffs"),
             (r#"{"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC"}}"#, "l2Book"),
-            (r#"{"method":"subscribe","subscription":{"type":"orderUpdates","user":"0xABcDEF1234567890abcdef1234567890AbCdEf12"}}"#, "orderUpdates"),
+            (
+                r#"{"method":"subscribe","subscription":{"type":"orderUpdates","user":"0xABcDEF1234567890abcdef1234567890AbCdEf12"}}"#,
+                "orderUpdates",
+            ),
         ];
         for (json, label) in cases {
             let msg: ClientMessage = serde_json::from_str(json).expect(&format!("failed to parse {label}"));

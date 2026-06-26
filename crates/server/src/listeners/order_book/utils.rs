@@ -39,8 +39,10 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
             // data_dir should be the path containing node_*_by_block directories
             // Snapshot goes to parent of data_dir (sibling to "data" folder)
             let parent_dir = config.data_dir.parent().unwrap_or(&config.data_dir);
-            let output_path =
-                config.snapshot_output_path.clone().unwrap_or_else(|| get_default_docker_snapshot_output_path(parent_dir));
+            let output_path = config
+                .snapshot_output_path
+                .clone()
+                .unwrap_or_else(|| get_default_docker_snapshot_output_path(parent_dir));
             let visor_path = config
                 .visor_state_path
                 .clone()
@@ -92,10 +94,8 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
             let abci_path = resolve_abci_state_path(config);
             let output_path =
                 config.snapshot_output_path.clone().unwrap_or_else(|| PathBuf::from("/tmp/hl_snapshot.json"));
-            let visor_path = config
-                .visor_state_path
-                .clone()
-                .unwrap_or_else(|| get_default_visor_path(&config.data_dir));
+            let visor_path =
+                config.visor_state_path.clone().unwrap_or_else(|| get_default_visor_path(&config.data_dir));
 
             info!(
                 "Running: {} --chain Mainnet compute-l4-snapshots --include-users {} {}",
@@ -174,17 +174,11 @@ fn resolve_abci_state_path(config: &SnapshotConfig) -> PathBuf {
 }
 
 fn get_default_abci_state_path(data_dir: &Path) -> PathBuf {
-    data_dir
-        .parent()
-        .unwrap_or(data_dir)
-        .join("hyperliquid_data/abci_state.rmp")
+    data_dir.parent().unwrap_or(data_dir).join("hyperliquid_data/abci_state.rmp")
 }
 
 fn get_default_visor_path(data_dir: &Path) -> PathBuf {
-    data_dir
-        .parent()
-        .unwrap_or(data_dir)
-        .join("hyperliquid_data/visor_abci_state.json")
+    data_dir.parent().unwrap_or(data_dir).join("hyperliquid_data/visor_abci_state.json")
 }
 
 fn get_default_docker_snapshot_output_path(parent_dir: &Path) -> PathBuf {
@@ -246,7 +240,7 @@ pub(super) fn get_visor_path(config: &SnapshotConfig) -> PathBuf {
 }
 
 impl L2SnapshotParams {
-    pub(crate) const fn new(n_sig_figs: Option<u32>, mantissa: Option<u64>) -> Self {
+    pub const fn new(n_sig_figs: Option<u32>, mantissa: Option<u64>) -> Self {
         Self { n_sig_figs, mantissa }
     }
 }
@@ -443,10 +437,7 @@ mod tests {
         fs::write(dated_dir.join("1047420000.rmp"), b"new").unwrap();
         fs::write(dated_dir.join("not_snapshot.txt"), b"ignore").unwrap();
 
-        assert_eq!(
-            find_latest_periodic_abci_state(&data_dir),
-            Some(dated_dir.join("1047420000.rmp"))
-        );
+        assert_eq!(find_latest_periodic_abci_state(&data_dir), Some(dated_dir.join("1047420000.rmp")));
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -591,7 +582,8 @@ mod tests {
         books.add_order(order(2, "ETH", Side::Bid, "1", "3000"));
 
         let mut cache = HashMap::new();
-        let (_, recomputed, changed) = compute_l2_snapshots_incremental(&books, &HashSet::new(), &all_params(), &mut cache);
+        let (_, recomputed, changed) =
+            compute_l2_snapshots_incremental(&books, &HashSet::new(), &all_params(), &mut cache);
         assert!(changed, "first build introduces coins to the cache");
         assert!(recomputed.contains("BTC") && recomputed.contains("ETH"));
 
@@ -604,7 +596,8 @@ mod tests {
 
         // Evicting a coin flags a coin-set change (universe must be rebuilt).
         books.cancel_order(crate::order_book::Oid::new(1), Coin::new("BTC"));
-        let (_, recomputed, changed) = compute_l2_snapshots_incremental(&books, &HashSet::new(), &all_params(), &mut cache);
+        let (_, recomputed, changed) =
+            compute_l2_snapshots_incremental(&books, &HashSet::new(), &all_params(), &mut cache);
         assert!(changed, "eviction must flag a universe change");
         assert!(recomputed.is_empty());
     }

@@ -1,0 +1,33 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+alloy.workspace = true
+axum.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+clap.workspace = true
+dirs.workspace = true
+futures-util.workspace = true
+itertools.workspace = true
+lazy_static.workspace = true
+log.workspace = true
+notify.workspace = true
+prometheus.workspace = true
+rayon.workspace = true
+rustc-hash.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+slab.workspace = true
+sonic-rs.workspace = true
+strum_macros.workspace = true
+tokio.workspace = true
+yawc.workspace = true
+
+[features]
+default = []
+
+[lints]
+workspace = true

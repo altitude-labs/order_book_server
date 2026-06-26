@@ -10,7 +10,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct NodeDataOrderDiff {
+pub struct NodeDataOrderDiff {
     user: Address,
     oid: u64,
     px: String,
@@ -19,15 +19,31 @@ pub(crate) struct NodeDataOrderDiff {
 }
 
 impl NodeDataOrderDiff {
-    pub(crate) const fn diff(&self) -> &OrderDiff {
+    pub const fn user(&self) -> Address {
+        self.user
+    }
+
+    pub const fn diff(&self) -> &OrderDiff {
         &self.raw_book_diff
     }
     pub(crate) const fn oid(&self) -> Oid {
         Oid::new(self.oid)
     }
 
+    pub const fn oid_value(&self) -> u64 {
+        self.oid
+    }
+
+    pub fn px(&self) -> &str {
+        &self.px
+    }
+
     pub(crate) fn coin(&self) -> Coin {
         Coin::new(&self.coin)
+    }
+
+    pub fn coin_str(&self) -> &str {
+        &self.coin
     }
 }
 
@@ -35,7 +51,7 @@ impl NodeDataOrderDiff {
 pub(crate) struct NodeDataFill(pub Address, pub Fill);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct NodeDataOrderStatus {
+pub struct NodeDataOrderStatus {
     pub time: NaiveDateTime,
     pub user: Address,
     #[serde(default)]
@@ -116,7 +132,6 @@ impl<E> Batch<E> {
     pub(crate) fn events_len(&self) -> usize {
         self.events.len()
     }
-
 }
 
 #[cfg(test)]
@@ -146,7 +161,13 @@ mod tests {
         }
     }
 
-    fn make_order_status(status: &str, is_trigger: bool, tif: Option<&str>, coin: &str, oid: u64) -> NodeDataOrderStatus {
+    fn make_order_status(
+        status: &str,
+        is_trigger: bool,
+        tif: Option<&str>,
+        coin: &str,
+        oid: u64,
+    ) -> NodeDataOrderStatus {
         let mut order = make_l4_order(coin, oid);
         order.is_trigger = is_trigger;
         order.tif = tif.map(String::from);
@@ -223,8 +244,14 @@ mod tests {
     fn test_event_source_streaming_dirs() {
         let dir = std::path::Path::new("/data");
         assert_eq!(EventSource::Fills.event_source_dir_streaming(dir), PathBuf::from("/data/node_fills_streaming"));
-        assert_eq!(EventSource::OrderStatuses.event_source_dir_streaming(dir), PathBuf::from("/data/node_order_statuses_streaming"));
-        assert_eq!(EventSource::OrderDiffs.event_source_dir_streaming(dir), PathBuf::from("/data/node_raw_book_diffs_streaming"));
+        assert_eq!(
+            EventSource::OrderStatuses.event_source_dir_streaming(dir),
+            PathBuf::from("/data/node_order_statuses_streaming")
+        );
+        assert_eq!(
+            EventSource::OrderDiffs.event_source_dir_streaming(dir),
+            PathBuf::from("/data/node_raw_book_diffs_streaming")
+        );
     }
 
     // ==================== NodeDataOrderDiff Tests ====================

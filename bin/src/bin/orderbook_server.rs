@@ -1,7 +1,11 @@
+#![allow(unused_crate_dependencies)]
+
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
+#[cfg(feature = "grpc")]
+use grpc::run_grpc_server;
 use server::{Result, ServerConfig, SnapshotMode, run_websocket_server};
 
 // The fan-out path allocates heavily (per-level price/size strings, per-coin
@@ -24,8 +28,18 @@ pub enum Markets {
     All,
 }
 
+/// Transport server to run
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+pub enum Transport {
+    /// WebSocket server using the existing JSON API
+    #[default]
+    Websocket,
+    /// gRPC server using typed protobuf payloads
+    Grpc,
+}
+
 #[derive(Debug, Parser)]
-#[command(author, version, about = "Real-time Orderbook WebSocket Server for Hyperliquid")]
+#[command(author, version, about = "Real-time Orderbook Server for Hyperliquid")]
 struct Args {
     /// Server address (e.g., 0.0.0.0)
     #[arg(long, default_value = "0.0.0.0")]
@@ -34,6 +48,10 @@ struct Args {
     /// Server port (e.g., 8000)
     #[arg(long, default_value = "8000")]
     port: u16,
+
+    /// Transport server to run: websocket or grpc
+    #[arg(long, value_enum, default_value = "websocket")]
+    transport: Transport,
 
     /// Compression level for WebSocket connections (0-9).
     /// 0 = disabled, 1 = fastest (default), 9 = best ratio
@@ -180,6 +198,7 @@ async fn main() -> Result<()> {
 
     println!("Orderbook Server v{}", env!("CARGO_PKG_VERSION"));
     println!("  Address: {}", config.address);
+    println!("  Transport: {:?}", args.transport);
     println!("  Markets: {:?}", args.markets);
     if config.bbo_only {
         println!("  Mode: BBO-ONLY (lightweight, ~100MB RAM)");
@@ -230,7 +249,7 @@ async fn main() -> Result<()> {
     }
 
     tokio::select! {
-        result = run_websocket_server(config) => {
+        result = run_selected_transport(args.transport, config) => {
             if let Err(e) = result {
                 log::error!("Server error: {e}");
             }
@@ -241,4 +260,21 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn run_selected_transport(transport: Transport, config: ServerConfig) -> Result<()> {
+    match transport {
+        Transport::Websocket => run_websocket_server(config).await,
+        Transport::Grpc => run_grpc_transport(config).await,
+    }
+}
+
+#[cfg(feature = "grpc")]
+async fn run_grpc_transport(config: ServerConfig) -> Result<()> {
+    run_grpc_server(config).await
+}
+
+#[cfg(not(feature = "grpc"))]
+async fn run_grpc_transport(_config: ServerConfig) -> Result<()> {
+    Err("gRPC transport requested, but this binary was built without the `grpc` feature".into())
 }

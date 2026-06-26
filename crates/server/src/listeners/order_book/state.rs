@@ -75,7 +75,12 @@ impl OrderBookState {
         &self,
         changed_coins: &HashSet<Coin>,
         active: &HashSet<crate::listeners::order_book::L2SnapshotParams>,
-        cache: &mut HashMap<Coin, std::sync::Arc<HashMap<crate::listeners::order_book::L2SnapshotParams, Snapshot<crate::types::inner::InnerLevel>>>>,
+        cache: &mut HashMap<
+            Coin,
+            std::sync::Arc<
+                HashMap<crate::listeners::order_book::L2SnapshotParams, Snapshot<crate::types::inner::InnerLevel>>,
+            >,
+        >,
     ) -> (u64, L2Snapshots, HashSet<Coin>, bool) {
         let (snapshots, recomputed, coin_set_changed) =
             crate::listeners::order_book::utils::compute_l2_snapshots_incremental(
@@ -368,7 +373,8 @@ mod tests {
             "px": "100.0",
             "coin": coin,
             "raw_book_diff": diff
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     fn make_status_batch(statuses: Vec<NodeDataOrderStatus>) -> Batch<NodeDataOrderStatus> {
@@ -377,7 +383,8 @@ mod tests {
             "block_time": "2024-01-15T10:30:00.000000000",
             "block_number": 100,
             "events": statuses
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     fn make_diff_batch(diffs: Vec<NodeDataOrderDiff>) -> Batch<NodeDataOrderDiff> {
@@ -386,7 +393,8 @@ mod tests {
             "block_time": "2024-01-15T10:30:00.000000000",
             "block_number": 100,
             "events": diffs
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     // ==================== Initialization Tests ====================
@@ -461,7 +469,8 @@ mod tests {
         assert_eq!(state.order_count(), 1);
 
         // Now send Update
-        let update = make_order_diff("BTC", 1, OrderDiff::Update { orig_sz: "5.0".to_string(), new_sz: "3.0".to_string() });
+        let update =
+            make_order_diff("BTC", 1, OrderDiff::Update { orig_sz: "5.0".to_string(), new_sz: "3.0".to_string() });
         let changed = state.apply_order_diffs_hft(make_diff_batch(vec![update])).unwrap();
         assert!(changed.contains(&Coin::new("BTC")));
     }
@@ -533,7 +542,8 @@ mod tests {
             "block_time": "2024-01-15T10:30:00.000000000",
             "block_number": 500,
             "events": []
-        })).unwrap();
+        }))
+        .unwrap();
         state.apply_order_diffs_hft(batch).unwrap();
         assert_eq!(state.height(), 500);
     }
@@ -547,7 +557,8 @@ mod tests {
             "block_time": "2024-01-15T10:31:00.000000000",
             "block_number": 500,
             "events": []
-        })).unwrap();
+        }))
+        .unwrap();
         state.apply_order_diffs_hft(batch).unwrap();
 
         // Try to go to 200
@@ -556,7 +567,8 @@ mod tests {
             "block_time": "2024-01-15T10:30:00.000000000",
             "block_number": 200,
             "events": []
-        })).unwrap();
+        }))
+        .unwrap();
         state.apply_order_diffs_hft(batch).unwrap();
         assert_eq!(state.height(), 500); // unchanged
     }

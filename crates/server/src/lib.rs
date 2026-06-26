@@ -4,6 +4,7 @@ pub mod metrics;
 mod order_book;
 mod prelude;
 mod servers;
+pub mod transport;
 mod types;
 
 use std::path::PathBuf;
