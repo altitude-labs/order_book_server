@@ -37,16 +37,55 @@ impl Channel {
     }
 }
 
-#[derive(Debug, Parser)]
-#[command(about = "Compare client-observed latency for matching WebSocket and gRPC orderbook messages")]
-struct Args {
-    /// WebSocket endpoint, usually ws://host:port/ws
-    #[arg(long)]
-    ws: String,
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Transport {
+    Websocket,
+    Grpc,
+}
 
-    /// gRPC endpoint, usually http://host:port
+impl Transport {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Websocket => "websocket",
+            Self::Grpc => "grpc",
+        }
+    }
+}
+
+#[derive(Debug, Parser, Clone)]
+#[command(about = "Compare client-observed latency for matching orderbook messages across two endpoints")]
+struct Args {
+    /// Endpoint A URL. WebSocket example: ws://host:port/ws. gRPC example: http://host:port
     #[arg(long)]
-    grpc: String,
+    endpoint_a: Option<String>,
+
+    /// Endpoint A transport
+    #[arg(long, value_enum, default_value = "websocket")]
+    transport_a: Transport,
+
+    /// Label for endpoint A in output
+    #[arg(long, default_value = "a")]
+    label_a: String,
+
+    /// Endpoint B URL. WebSocket example: ws://host:port/ws. gRPC example: http://host:port
+    #[arg(long)]
+    endpoint_b: Option<String>,
+
+    /// Endpoint B transport
+    #[arg(long, value_enum, default_value = "grpc")]
+    transport_b: Transport,
+
+    /// Label for endpoint B in output
+    #[arg(long, default_value = "b")]
+    label_b: String,
+
+    /// Legacy WebSocket endpoint, usually ws://host:port/ws. Equivalent to --endpoint-a with --transport-a websocket.
+    #[arg(long)]
+    ws: Option<String>,
+
+    /// Legacy gRPC endpoint, usually http://host:port. Equivalent to --endpoint-b with --transport-b grpc.
+    #[arg(long)]
+    grpc: Option<String>,
 
     /// Channel to subscribe to on both transports
     #[arg(long, value_enum, default_value = "bbo")]
@@ -90,23 +129,31 @@ struct Args {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum Source {
-    WebSocket,
-    Grpc,
+enum EndpointSide {
+    A,
+    B,
 }
 
-impl Source {
-    const fn label(self) -> &'static str {
+impl EndpointSide {
+    const fn other(self) -> Self {
         match self {
-            Self::WebSocket => "websocket",
-            Self::Grpc => "grpc",
+            Self::A => Self::B,
+            Self::B => Self::A,
         }
     }
 }
 
+#[derive(Debug, Clone)]
+struct EndpointConfig {
+    side: EndpointSide,
+    label: String,
+    transport: Transport,
+    url: String,
+}
+
 #[derive(Debug)]
 struct Observed {
-    source: Source,
+    source: EndpointSide,
     key: String,
     channel: &'static str,
     recv_us: u128,
@@ -116,7 +163,7 @@ struct Observed {
 #[derive(Debug)]
 struct Pending {
     channel: &'static str,
-    first_source: Source,
+    first_source: EndpointSide,
     first_recv_us: u128,
     first_seen_at: Instant,
     sample: Value,
@@ -126,43 +173,49 @@ struct Pending {
 struct Stats {
     started_at: Instant,
     total_matches: u64,
-    total_missing_websocket: u64,
-    total_missing_grpc: u64,
+    total_missing_a: u64,
+    total_missing_b: u64,
     interval_matches: u64,
-    interval_missing_websocket: u64,
-    interval_missing_grpc: u64,
+    interval_missing_a: u64,
+    interval_missing_b: u64,
     interval_deltas_us: Vec<i64>,
+    label_a: String,
+    label_b: String,
 }
 
+const OUTLIER_THRESHOLD_US: i64 = 10_000;
+
 impl Stats {
-    fn new(started_at: Instant) -> Self {
+    fn new(started_at: Instant, label_a: String, label_b: String) -> Self {
         Self {
             started_at,
             total_matches: 0,
-            total_missing_websocket: 0,
-            total_missing_grpc: 0,
+            total_missing_a: 0,
+            total_missing_b: 0,
             interval_matches: 0,
-            interval_missing_websocket: 0,
-            interval_missing_grpc: 0,
+            interval_missing_a: 0,
+            interval_missing_b: 0,
             interval_deltas_us: Vec::new(),
+            label_a,
+            label_b,
         }
     }
 
-    fn record_match(&mut self, grpc_minus_websocket_us: i64) {
+    fn record_match(&mut self, b_minus_a_us: i64) {
         self.total_matches += 1;
         self.interval_matches += 1;
-        self.interval_deltas_us.push(grpc_minus_websocket_us);
+        self.interval_deltas_us.push(b_minus_a_us);
     }
 
-    fn record_missing(&mut self, missing: Source) {
+    const fn record_missing(&mut self, missing: EndpointSide) {
         match missing {
-            Source::WebSocket => {
-                self.total_missing_websocket += 1;
-                self.interval_missing_websocket += 1;
+            EndpointSide::A => {
+                self.total_missing_a += 1;
+                self.interval_missing_a += 1;
             }
-            Source::Grpc => {
-                self.total_missing_grpc += 1;
-                self.interval_missing_grpc += 1;
+            EndpointSide::B => {
+                self.total_missing_b += 1;
+                self.interval_missing_b += 1;
             }
         }
     }
@@ -175,36 +228,67 @@ impl Stats {
         } else {
             Some(self.interval_deltas_us.iter().sum::<i64>() as f64 / delta_count as f64)
         };
+        let min = self.interval_deltas_us.first().copied();
+        let p50 = percentile(&self.interval_deltas_us, 50);
+        let p95 = percentile(&self.interval_deltas_us, 95);
+        let p99 = percentile(&self.interval_deltas_us, 99);
+        let max = self.interval_deltas_us.last().copied();
+        let b_ahead_over_10ms = self.interval_deltas_us.iter().filter(|delta| **delta <= -OUTLIER_THRESHOLD_US).count();
+        let a_ahead_over_10ms = self.interval_deltas_us.iter().filter(|delta| **delta >= OUTLIER_THRESHOLD_US).count();
+        let largest_b_ahead = self.interval_deltas_us.first().copied().filter(|delta| *delta < 0).map(i64::abs);
+        let largest_a_ahead = self.interval_deltas_us.last().copied().filter(|delta| *delta > 0);
 
         let summary = json!({
             "type": "summary",
-            "uptimeSeconds": self.started_at.elapsed().as_secs(),
+            "uptime": format!("{:?}", self.started_at.elapsed()),
+            "labels": {
+                "a": &self.label_a,
+                "b": &self.label_b,
+            },
             "interval": {
                 "matches": self.interval_matches,
-                "missingWebsocket": self.interval_missing_websocket,
-                "missingGrpc": self.interval_missing_grpc,
-                "grpcFaster": self.interval_deltas_us.iter().filter(|delta| **delta < 0).count(),
-                "websocketFaster": self.interval_deltas_us.iter().filter(|delta| **delta > 0).count(),
+                "missingA": self.interval_missing_a,
+                "missingB": self.interval_missing_b,
+                "bFaster": self.interval_deltas_us.iter().filter(|delta| **delta < 0).count(),
+                "aFaster": self.interval_deltas_us.iter().filter(|delta| **delta > 0).count(),
                 "ties": self.interval_deltas_us.iter().filter(|delta| **delta == 0).count(),
-                "grpcMinusWebsocketUs": {
+                "outliers": {
+                    "threshold": format_signed_duration_us(OUTLIER_THRESHOLD_US),
+                    "thresholdUs": OUTLIER_THRESHOLD_US,
+                    "bAheadOverThreshold": b_ahead_over_10ms,
+                    "aAheadOverThreshold": a_ahead_over_10ms,
+                    "largestBAhead": largest_b_ahead.map(format_duration_us),
+                    "largestBAheadUs": largest_b_ahead,
+                    "largestAAhead": largest_a_ahead.map(format_duration_us),
+                    "largestAAheadUs": largest_a_ahead,
+                },
+                "bMinusAUs": {
                     "avg": avg,
-                    "min": self.interval_deltas_us.first().copied(),
-                    "p50": percentile(&self.interval_deltas_us, 50),
-                    "p95": percentile(&self.interval_deltas_us, 95),
-                    "p99": percentile(&self.interval_deltas_us, 99),
-                    "max": self.interval_deltas_us.last().copied(),
+                    "min": min,
+                    "p50": p50,
+                    "p95": p95,
+                    "p99": p99,
+                    "max": max,
+                },
+                "bMinusA": {
+                    "avg": avg.map(format_signed_duration_us_f64),
+                    "min": min.map(format_signed_duration_us),
+                    "p50": p50.map(format_signed_duration_us),
+                    "p95": p95.map(format_signed_duration_us),
+                    "p99": p99.map(format_signed_duration_us),
+                    "max": max.map(format_signed_duration_us),
                 },
             },
             "total": {
                 "matches": self.total_matches,
-                "missingWebsocket": self.total_missing_websocket,
-                "missingGrpc": self.total_missing_grpc,
+                "missingA": self.total_missing_a,
+                "missingB": self.total_missing_b,
             },
         });
 
         self.interval_matches = 0;
-        self.interval_missing_websocket = 0;
-        self.interval_missing_grpc = 0;
+        self.interval_missing_a = 0;
+        self.interval_missing_b = 0;
         self.interval_deltas_us.clear();
 
         summary
@@ -215,36 +299,20 @@ impl Stats {
 async fn main() -> Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
+    let [endpoint_a, endpoint_b] = endpoint_configs(&args)?;
 
     let (observed_tx, mut observed_rx) = mpsc::channel::<Observed>(8192);
     let start = Instant::now();
 
-    tokio::spawn({
-        let args = args.clone_for_task();
-        let tx = observed_tx.clone();
-        async move {
-            if let Err(err) = listen_websocket(args, tx, start).await {
-                eprintln!("websocket listener exited: {err}");
-            }
-        }
-    });
-
-    tokio::spawn({
-        let args = args.clone_for_task();
-        let tx = observed_tx;
-        async move {
-            if let Err(err) = listen_grpc(args, tx, start).await {
-                eprintln!("grpc listener exited: {err}");
-            }
-        }
-    });
+    spawn_listener(args.clone(), endpoint_a.clone(), observed_tx.clone(), start);
+    spawn_listener(args.clone(), endpoint_b.clone(), observed_tx, start);
 
     let timeout = Duration::from_millis(args.match_timeout_ms);
     let mut pending: HashMap<String, Pending> = HashMap::new();
     let mut matched = 0usize;
     let mut cleanup = tokio::time::interval(Duration::from_millis((args.match_timeout_ms / 2).max(100)));
     let mut summary = tokio::time::interval(Duration::from_secs(args.summary_interval_sec.max(1)));
-    let mut stats = Stats::new(start);
+    let mut stats = Stats::new(start, endpoint_a.label.clone(), endpoint_b.label.clone());
 
     loop {
         tokio::select! {
@@ -257,18 +325,19 @@ async fn main() -> Result<()> {
 
                     matched += 1;
                     let delta_us = observed.recv_us as i128 - previous.first_recv_us as i128;
-                    let grpc_minus_websocket_us = clamp_i64(if observed.source == Source::Grpc { delta_us } else { -delta_us });
-                    stats.record_match(grpc_minus_websocket_us);
+                    let b_minus_a_us = clamp_i64(if observed.source == EndpointSide::B { delta_us } else { -delta_us });
+                    stats.record_match(b_minus_a_us);
                     if !args.quiet_matches {
                         println!("{}", json!({
                             "type": "match",
                             "channel": observed.channel,
                             "key": observed.key,
-                            "first": previous.first_source.label(),
-                            "second": observed.source.label(),
-                            "websocketRecvUs": if observed.source == Source::WebSocket { observed.recv_us } else { previous.first_recv_us },
-                            "grpcRecvUs": if observed.source == Source::Grpc { observed.recv_us } else { previous.first_recv_us },
-                            "grpcMinusWebsocketUs": grpc_minus_websocket_us,
+                            "first": endpoint_label(previous.first_source, &endpoint_a, &endpoint_b),
+                            "second": endpoint_label(observed.source, &endpoint_a, &endpoint_b),
+                            "aRecvUs": if observed.source == EndpointSide::A { observed.recv_us } else { previous.first_recv_us },
+                            "bRecvUs": if observed.source == EndpointSide::B { observed.recv_us } else { previous.first_recv_us },
+                            "bMinusAUs": b_minus_a_us,
+                            "bMinusA": format_signed_duration_us(b_minus_a_us),
                         }));
                     }
 
@@ -298,17 +367,14 @@ async fn main() -> Result<()> {
                     }
                 });
                 for (key, channel, first_source, first_recv_us, sample) in expired {
-                    let missing = match first_source {
-                        Source::WebSocket => Source::Grpc,
-                        Source::Grpc => Source::WebSocket,
-                    };
+                    let missing = first_source.other();
                     stats.record_missing(missing);
                     println!("{}", json!({
                         "type": "missing_match",
                         "channel": channel,
                         "key": key,
-                        "seenOn": first_source.label(),
-                        "missingOn": missing.label(),
+                        "seenOn": endpoint_label(first_source, &endpoint_a, &endpoint_b),
+                        "missingOn": endpoint_label(missing, &endpoint_a, &endpoint_b),
                         "waitedMs": args.match_timeout_ms,
                         "firstRecvUs": first_recv_us,
                         "sample": sample,
@@ -322,26 +388,75 @@ async fn main() -> Result<()> {
     }
 }
 
-impl Args {
-    fn clone_for_task(&self) -> Self {
-        Self {
-            ws: self.ws.clone(),
-            grpc: self.grpc.clone(),
-            channel: self.channel,
-            coin: self.coin.clone(),
-            user: self.user.clone(),
-            n_sig_figs: self.n_sig_figs,
-            mantissa: self.mantissa,
-            n_levels: self.n_levels,
-            match_timeout_ms: self.match_timeout_ms,
-            max_matches: self.max_matches,
-            summary_interval_sec: self.summary_interval_sec,
-            quiet_matches: self.quiet_matches,
+fn spawn_listener(args: Args, endpoint: EndpointConfig, observed_tx: mpsc::Sender<Observed>, start: Instant) {
+    tokio::spawn(async move {
+        let result = match endpoint.transport {
+            Transport::Websocket => listen_websocket(&args, endpoint.clone(), observed_tx, start).await,
+            Transport::Grpc => listen_grpc(&args, endpoint.clone(), observed_tx, start).await,
+        };
+        if let Err(err) = result {
+            eprintln!("{} listener exited ({} {}): {err}", endpoint.label, endpoint.transport.label(), endpoint.url);
         }
+    });
+}
+
+fn endpoint_label<'a>(side: EndpointSide, endpoint_a: &'a EndpointConfig, endpoint_b: &'a EndpointConfig) -> &'a str {
+    match side {
+        EndpointSide::A => &endpoint_a.label,
+        EndpointSide::B => &endpoint_b.label,
+    }
+}
+
+fn endpoint_configs(args: &Args) -> Result<[EndpointConfig; 2]> {
+    match (&args.endpoint_a, &args.endpoint_b, &args.ws, &args.grpc) {
+        (Some(endpoint_a), Some(endpoint_b), None, None) => Ok([
+            EndpointConfig {
+                side: EndpointSide::A,
+                label: args.label_a.clone(),
+                transport: args.transport_a,
+                url: endpoint_a.clone(),
+            },
+            EndpointConfig {
+                side: EndpointSide::B,
+                label: args.label_b.clone(),
+                transport: args.transport_b,
+                url: endpoint_b.clone(),
+            },
+        ]),
+        (None, None, Some(ws), Some(grpc)) => Ok([
+            EndpointConfig {
+                side: EndpointSide::A,
+                label: "websocket".to_string(),
+                transport: Transport::Websocket,
+                url: ws.clone(),
+            },
+            EndpointConfig {
+                side: EndpointSide::B,
+                label: "grpc".to_string(),
+                transport: Transport::Grpc,
+                url: grpc.clone(),
+            },
+        ]),
+        _ => Err("use either --endpoint-a/--endpoint-b or legacy --ws/--grpc, but do not mix them".into()),
     }
 }
 
 fn validate_args(args: &Args) -> Result<()> {
+    let using_new = args.endpoint_a.is_some() || args.endpoint_b.is_some();
+    let using_legacy = args.ws.is_some() || args.grpc.is_some();
+    if using_new && using_legacy {
+        return Err("use either --endpoint-a/--endpoint-b or legacy --ws/--grpc, not both".into());
+    }
+    if using_new && (args.endpoint_a.is_none() || args.endpoint_b.is_none()) {
+        return Err("--endpoint-a and --endpoint-b are both required".into());
+    }
+    if using_legacy && (args.ws.is_none() || args.grpc.is_none()) {
+        return Err("--ws and --grpc are both required in legacy mode".into());
+    }
+    if !using_new && !using_legacy {
+        return Err("--endpoint-a and --endpoint-b are required".into());
+    }
+
     match args.channel {
         Channel::Bbo | Channel::L2Book | Channel::Trades | Channel::BookDiffs => {
             if args.coin.is_none() {
@@ -357,10 +472,15 @@ fn validate_args(args: &Args) -> Result<()> {
     Ok(())
 }
 
-async fn listen_websocket(args: Args, observed_tx: mpsc::Sender<Observed>, start: Instant) -> Result<()> {
-    let (mut socket, _) = connect_async(&args.ws).await?;
-    socket.send(Message::Text(ws_subscribe_message(&args)?.to_string().into())).await?;
-    eprintln!("websocket connected: {}", args.ws);
+async fn listen_websocket(
+    args: &Args,
+    endpoint: EndpointConfig,
+    observed_tx: mpsc::Sender<Observed>,
+    start: Instant,
+) -> Result<()> {
+    let (mut socket, _) = connect_async(&endpoint.url).await?;
+    socket.send(Message::Text(ws_subscribe_message(args)?.to_string().into())).await?;
+    eprintln!("{} connected: {} {}", endpoint.label, endpoint.transport.label(), endpoint.url);
 
     while let Some(message) = socket.next().await {
         let message = message?;
@@ -373,7 +493,7 @@ async fn listen_websocket(args: Args, observed_tx: mpsc::Sender<Observed>, start
         };
 
         let value: Value = serde_json::from_str(&text)?;
-        for observed in observations_from_ws(&value, start.elapsed().as_micros()) {
+        for observed in observations_from_ws(endpoint.side, &value, start.elapsed().as_micros()) {
             if observed_tx.send(observed).await.is_err() {
                 return Ok(());
             }
@@ -383,16 +503,21 @@ async fn listen_websocket(args: Args, observed_tx: mpsc::Sender<Observed>, start
     Ok(())
 }
 
-async fn listen_grpc(args: Args, observed_tx: mpsc::Sender<Observed>, start: Instant) -> Result<()> {
-    let mut client = pb::orderbook_client::OrderbookClient::connect(args.grpc.clone()).await?;
+async fn listen_grpc(
+    args: &Args,
+    endpoint: EndpointConfig,
+    observed_tx: mpsc::Sender<Observed>,
+    start: Instant,
+) -> Result<()> {
+    let mut client = pb::orderbook_client::OrderbookClient::connect(endpoint.url.clone()).await?;
     let (request_tx, request_rx) = mpsc::channel(8);
-    request_tx.send(grpc_subscribe_message(&args)?).await?;
+    request_tx.send(grpc_subscribe_message(args)?).await?;
 
     let mut stream = client.stream(ReceiverStream::new(request_rx)).await?.into_inner();
-    eprintln!("grpc connected: {}", args.grpc);
+    eprintln!("{} connected: {} {}", endpoint.label, endpoint.transport.label(), endpoint.url);
 
     while let Some(message) = stream.message().await? {
-        for observed in observations_from_grpc(&message, start.elapsed().as_micros()) {
+        for observed in observations_from_grpc(endpoint.side, &message, start.elapsed().as_micros()) {
             if observed_tx.send(observed).await.is_err() {
                 return Ok(());
             }
@@ -454,40 +579,40 @@ fn required_user(args: &Args) -> Result<String> {
     args.user.clone().ok_or_else(|| "--user is required".into())
 }
 
-fn observations_from_ws(message: &Value, recv_us: u128) -> Vec<Observed> {
+fn observations_from_ws(source: EndpointSide, message: &Value, recv_us: u128) -> Vec<Observed> {
     let Some(channel) = message.get("channel").and_then(Value::as_str) else {
         return Vec::new();
     };
     let data = &message["data"];
 
     match channel {
-        "bbo" => observed_one(Source::WebSocket, "bbo", bbo_key_json(data), recv_us, data.clone()),
-        "l2Book" => observed_one(Source::WebSocket, "l2Book", l2_key_json(data), recv_us, data.clone()),
-        "trades" => observed_many_json(Source::WebSocket, "trades", data, trade_key_json, recv_us),
-        "bookDiffs" => observed_many_json(Source::WebSocket, "bookDiffs", data, book_diff_key_json, recv_us),
-        "orderUpdates" => observed_many_json(Source::WebSocket, "orderUpdates", data, order_update_key_json, recv_us),
+        "bbo" => observed_one(source, "bbo", bbo_key_json(data), recv_us, data.clone()),
+        "l2Book" => observed_one(source, "l2Book", l2_key_json(data), recv_us, data.clone()),
+        "trades" => observed_many_json(source, "trades", data, trade_key_json, recv_us),
+        "bookDiffs" => observed_many_json(source, "bookDiffs", data, book_diff_key_json, recv_us),
+        "orderUpdates" => observed_many_json(source, "orderUpdates", data, order_update_key_json, recv_us),
         _ => Vec::new(),
     }
 }
 
-fn observations_from_grpc(message: &pb::ServerMessage, recv_us: u128) -> Vec<Observed> {
+fn observations_from_grpc(source: EndpointSide, message: &pb::ServerMessage, recv_us: u128) -> Vec<Observed> {
     let Some(message) = &message.message else {
         return Vec::new();
     };
 
     match message {
         pb::server_message::Message::Bbo(bbo) => {
-            observed_one(Source::Grpc, "bbo", bbo_key_proto(bbo), recv_us, bbo_sample_proto(bbo))
+            observed_one(source, "bbo", bbo_key_proto(bbo), recv_us, bbo_sample_proto(bbo))
         }
         pb::server_message::Message::L2Book(book) => {
-            observed_one(Source::Grpc, "l2Book", l2_key_proto(book), recv_us, l2_sample_proto(book))
+            observed_one(source, "l2Book", l2_key_proto(book), recv_us, l2_sample_proto(book))
         }
         pb::server_message::Message::Trades(trades) => trades
             .trades
             .iter()
             .filter_map(|trade| {
                 Some(Observed {
-                    source: Source::Grpc,
+                    source,
                     key: trade_key_proto(trade)?,
                     channel: "trades",
                     recv_us,
@@ -500,7 +625,7 @@ fn observations_from_grpc(message: &pb::ServerMessage, recv_us: u128) -> Vec<Obs
             .iter()
             .filter_map(|diff| {
                 Some(Observed {
-                    source: Source::Grpc,
+                    source,
                     key: book_diff_key_proto(diff)?,
                     channel: "bookDiffs",
                     recv_us,
@@ -513,7 +638,7 @@ fn observations_from_grpc(message: &pb::ServerMessage, recv_us: u128) -> Vec<Obs
             .iter()
             .filter_map(|update| {
                 Some(Observed {
-                    source: Source::Grpc,
+                    source,
                     key: order_update_key_proto(update)?,
                     channel: "orderUpdates",
                     recv_us,
@@ -530,7 +655,7 @@ fn observations_from_grpc(message: &pb::ServerMessage, recv_us: u128) -> Vec<Obs
 }
 
 fn observed_one(
-    source: Source,
+    source: EndpointSide,
     channel: &'static str,
     key: Option<String>,
     recv_us: u128,
@@ -540,7 +665,7 @@ fn observed_one(
 }
 
 fn observed_many_json(
-    source: Source,
+    source: EndpointSide,
     channel: &'static str,
     data: &Value,
     key_fn: fn(&Value) -> Option<String>,
@@ -755,6 +880,30 @@ fn percentile(sorted: &[i64], percentile: usize) -> Option<i64> {
 
 fn clamp_i64(value: i128) -> i64 {
     value.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+}
+
+fn format_signed_duration_us(value: i64) -> String {
+    format_signed_duration_us_f64(value as f64)
+}
+
+fn format_duration_us(value: i64) -> String {
+    format_duration_us_f64(value as f64)
+}
+
+fn format_signed_duration_us_f64(value: f64) -> String {
+    let sign = if value < 0.0 { "-" } else { "+" };
+    format!("{sign}{}", format_duration_us_f64(value.abs()))
+}
+
+fn format_duration_us_f64(value: f64) -> String {
+    let abs = value.abs();
+    if abs < 1_000.0 {
+        format!("{abs:.0}us")
+    } else if abs < 1_000_000.0 {
+        format!("{:.3}ms", abs / 1_000.0)
+    } else {
+        format!("{:.3}s", abs / 1_000_000.0)
+    }
 }
 
 fn bbo_sample_proto(bbo: &pb::Bbo) -> Value {

@@ -77,6 +77,10 @@ impl Coin {
         self.0.clone()
     }
 
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
     /// Returns true for spot markets: @ prefixed coins and PURR/USDC
     pub(crate) fn is_spot(&self) -> bool {
         self.0.starts_with('@') || self.0 == "PURR/USDC"

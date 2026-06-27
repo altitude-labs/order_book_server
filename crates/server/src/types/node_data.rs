@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     order_book::{Coin, Oid},
-    types::{Fill, L4Order, OrderDiff},
+    types::{Fill, L4Order, OrderDiff, TimeInForce},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,9 +63,53 @@ pub struct NodeDataOrderStatus {
 }
 
 impl NodeDataOrderStatus {
+    /// Order-status timestamp in unix milliseconds.
+    #[must_use]
+    pub fn time_ms(&self) -> u64 {
+        self.time.and_utc().timestamp_millis().max(0) as u64
+    }
+
+    /// Timestamp embedded in the nested order payload, already expressed in
+    /// unix milliseconds by the node.
+    #[must_use]
+    pub const fn order_timestamp_ms(&self) -> u64 {
+        self.order.timestamp
+    }
+
+    #[must_use]
+    pub(crate) fn status_kind(&self) -> OrderStatusKind {
+        OrderStatusKind::from_node_value(&self.status)
+    }
+
     pub(crate) fn is_inserted_into_book(&self) -> bool {
-        (self.status == "open" && !self.order.is_trigger && (self.order.tif != Some("Ioc".to_string())))
-            || (self.order.is_trigger && self.status == "triggered")
+        (self.status_kind() == OrderStatusKind::Open
+            && !self.order.is_trigger
+            && self.order.time_in_force() != Some(TimeInForce::ImmediateOrCancel))
+            || (self.order.is_trigger && self.status_kind() == OrderStatusKind::Triggered)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OrderStatusKind {
+    Open,
+    Triggered,
+    Filled,
+    Canceled,
+    Rejected,
+    Other,
+}
+
+impl OrderStatusKind {
+    #[must_use]
+    pub(crate) fn from_node_value(value: &str) -> Self {
+        match value {
+            "open" => Self::Open,
+            "triggered" => Self::Triggered,
+            "filled" => Self::Filled,
+            "canceled" => Self::Canceled,
+            "rejected" => Self::Rejected,
+            _ => Self::Other,
+        }
     }
 }
 
@@ -113,6 +157,13 @@ impl<E> Batch<E> {
     /// record would otherwise crash the whole listener task.
     pub(crate) fn block_time(&self) -> u64 {
         self.block_time.and_utc().timestamp_millis().max(0) as u64
+    }
+
+    /// Node-local write time in unix milliseconds. This is useful alongside
+    /// `block_time` to distinguish chain timestamp skew from local ingestion
+    /// latency.
+    pub(crate) fn local_time(&self) -> u64 {
+        self.local_time.and_utc().timestamp_millis().max(0) as u64
     }
 
     pub(crate) const fn block_number(&self) -> u64 {

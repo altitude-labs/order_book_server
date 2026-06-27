@@ -1,10 +1,10 @@
-use crate::metrics::WS_SUBSCRIPTIONS_ACTIVE;
+use crate::metrics::{TRANSPORT_SUBSCRIPTIONS_ACTIVE, WS_SUBSCRIPTIONS_ACTIVE};
 use crate::types::node_data::{NodeDataOrderDiff, NodeDataOrderStatus};
 use crate::types::{Bbo, L2Book, L4Book, Trade};
 use alloy::primitives::Address;
 use log::debug;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub const MAX_LEVELS: usize = 100;
 pub const DEFAULT_LEVELS: usize = 20;
@@ -103,14 +103,36 @@ impl Subscription {
 }
 
 impl Subscription {
-    pub const fn type_label(&self) -> &str {
+    pub const fn kind(&self) -> SubscriptionKind {
         match self {
-            Self::Bbo { .. } => "bbo",
-            Self::L2Book { .. } => "l2Book",
-            Self::L4Book { .. } => "l4Book",
-            Self::Trades { .. } => "trades",
-            Self::OrderUpdates { .. } => "orderUpdates",
-            Self::BookDiffs { .. } => "bookDiffs",
+            Self::Bbo { .. } => SubscriptionKind::Bbo,
+            Self::L2Book { .. } => SubscriptionKind::L2Book,
+            Self::L4Book { .. } => SubscriptionKind::L4Book,
+            Self::Trades { .. } => SubscriptionKind::Trades,
+            Self::OrderUpdates { .. } => SubscriptionKind::OrderUpdates,
+            Self::BookDiffs { .. } => SubscriptionKind::BookDiffs,
+        }
+    }
+
+    pub const fn type_label(&self) -> &'static str {
+        self.kind().label()
+    }
+
+    pub fn coin_key(&self) -> Option<&str> {
+        match self {
+            Self::Bbo { coin }
+            | Self::L2Book { coin, .. }
+            | Self::L4Book { coin }
+            | Self::Trades { coin }
+            | Self::BookDiffs { coin } => Some(coin),
+            Self::OrderUpdates { .. } => None,
+        }
+    }
+
+    fn user_key(&self) -> Option<Address> {
+        match self {
+            Self::OrderUpdates { user } => user.parse().ok(),
+            _ => None,
         }
     }
 }
@@ -146,31 +168,175 @@ pub(crate) enum ServerResponse {
     Error(String),
 }
 
-#[derive(Default)]
+impl ServerResponse {
+    pub(crate) const fn channel_label(&self) -> &'static str {
+        match self {
+            Self::SubscriptionResponse(_) => "subscriptionResponse",
+            Self::L2Book(_) => "l2Book",
+            Self::L4Book(_) => "l4Book",
+            Self::Trades(_) => "trades",
+            Self::Bbo(_) => "bbo",
+            Self::BookDiffs(_) => "bookDiffs",
+            Self::OrderUpdates(_) => "orderUpdates",
+            Self::Pong => "pong",
+            Self::Error(_) => "error",
+        }
+    }
+}
+
 pub struct SubscriptionManager {
+    transport: TransportKind,
     subscriptions: HashSet<Subscription>,
+    subscriptions_by_type: HashMap<SubscriptionKind, Vec<Subscription>>,
+    subscriptions_by_coin: HashMap<SubscriptionKind, HashMap<String, Vec<Subscription>>>,
+    order_updates_by_user: HashMap<Address, Vec<Subscription>>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub enum SubscriptionKind {
+    Bbo,
+    L2Book,
+    L4Book,
+    Trades,
+    OrderUpdates,
+    BookDiffs,
+}
+
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub enum FanoutChannel {
+    L2Book,
+    Bbo,
+    Trades,
+    BookDiffs,
+    OrderStatuses,
+}
+
+impl FanoutChannel {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::L2Book => "l2Book",
+            Self::Bbo => "bbo",
+            Self::Trades => "trades",
+            Self::BookDiffs => "bookDiffs",
+            Self::OrderStatuses => "orderStatuses",
+        }
+    }
+}
+
+impl SubscriptionKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Bbo => "bbo",
+            Self::L2Book => "l2Book",
+            Self::L4Book => "l4Book",
+            Self::Trades => "trades",
+            Self::OrderUpdates => "orderUpdates",
+            Self::BookDiffs => "bookDiffs",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum TransportKind {
+    Websocket,
+    Grpc,
+    Unknown,
+}
+
+impl TransportKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Websocket => "websocket",
+            Self::Grpc => "grpc",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub const fn uses_legacy_websocket_metrics(self) -> bool {
+        matches!(self, Self::Websocket)
+    }
+}
+
+impl Default for SubscriptionManager {
+    fn default() -> Self {
+        Self::new(TransportKind::Unknown)
+    }
 }
 
 impl SubscriptionManager {
+    pub fn new(transport: TransportKind) -> Self {
+        Self {
+            transport,
+            subscriptions: HashSet::new(),
+            subscriptions_by_type: HashMap::new(),
+            subscriptions_by_coin: HashMap::new(),
+            order_updates_by_user: HashMap::new(),
+        }
+    }
+
     /// Tries to add the subscription. Returns `Err` once the per-connection cap
     /// is reached, distinguishing "already subscribed" (Ok(false)) from "limit hit".
     pub fn subscribe(&mut self, sub: Subscription) -> Result<bool, &'static str> {
         if self.subscriptions.len() >= MAX_SUBSCRIPTIONS_PER_CONNECTION && !self.subscriptions.contains(&sub) {
             return Err("subscription limit reached for this connection");
         }
-        let label = sub.type_label().to_owned();
-        let inserted = self.subscriptions.insert(sub);
+        let kind = sub.kind();
+        let coin_key = sub.coin_key().map(str::to_string);
+        let user_key = sub.user_key();
+        let inserted = self.subscriptions.insert(sub.clone());
         if inserted {
-            WS_SUBSCRIPTIONS_ACTIVE.with_label_values(&[&label]).inc();
+            // Store a second copy by type so fan-out paths can skip unrelated
+            // subscription classes. Type buckets are Vec-backed because they are
+            // read on every broadcast; the main HashSet above still handles
+            // duplicate detection, and the per-connection cap bounds removal cost.
+            self.subscriptions_by_type.entry(kind).or_default().push(sub.clone());
+            if let Some(coin_key) = coin_key {
+                self.subscriptions_by_coin.entry(kind).or_default().entry(coin_key).or_default().push(sub);
+            } else if let Some(user_key) = user_key {
+                self.order_updates_by_user.entry(user_key).or_default().push(sub);
+            }
+            TRANSPORT_SUBSCRIPTIONS_ACTIVE.with_label_values(&[self.transport.label(), kind.label()]).inc();
+            if self.transport.uses_legacy_websocket_metrics() {
+                WS_SUBSCRIPTIONS_ACTIVE.with_label_values(&[kind.label()]).inc();
+            }
         }
         Ok(inserted)
     }
 
     pub fn unsubscribe(&mut self, sub: Subscription) -> bool {
-        let label = sub.type_label().to_owned();
+        let kind = sub.kind();
         let removed = self.subscriptions.remove(&sub);
         if removed {
-            WS_SUBSCRIPTIONS_ACTIVE.with_label_values(&[&label]).dec();
+            if let Some(by_type) = self.subscriptions_by_type.get_mut(&kind) {
+                by_type.retain(|candidate| candidate != &sub);
+                if by_type.is_empty() {
+                    self.subscriptions_by_type.remove(&kind);
+                }
+            }
+            if let Some(coin_key) = sub.coin_key()
+                && let Some(by_coin) = self.subscriptions_by_coin.get_mut(&kind)
+            {
+                if let Some(subscriptions) = by_coin.get_mut(coin_key) {
+                    subscriptions.retain(|candidate| candidate != &sub);
+                    if subscriptions.is_empty() {
+                        by_coin.remove(coin_key);
+                    }
+                }
+                if by_coin.is_empty() {
+                    self.subscriptions_by_coin.remove(&kind);
+                }
+            } else if let Some(user_key) = sub.user_key() {
+                if let Some(subscriptions) = self.order_updates_by_user.get_mut(&user_key) {
+                    subscriptions.retain(|candidate| candidate != &sub);
+                    if subscriptions.is_empty() {
+                        self.order_updates_by_user.remove(&user_key);
+                    }
+                }
+            }
+            TRANSPORT_SUBSCRIPTIONS_ACTIVE.with_label_values(&[self.transport.label(), kind.label()]).dec();
+            if self.transport.uses_legacy_websocket_metrics() {
+                WS_SUBSCRIPTIONS_ACTIVE.with_label_values(&[kind.label()]).dec();
+            }
         }
         removed
     }
@@ -178,12 +344,50 @@ impl SubscriptionManager {
     pub const fn subscriptions(&self) -> &HashSet<Subscription> {
         &self.subscriptions
     }
+
+    pub fn subscriptions_for_type(&self, kind: SubscriptionKind) -> impl Iterator<Item = &Subscription> {
+        self.subscriptions_by_type.get(&kind).into_iter().flat_map(|subscriptions| subscriptions.iter())
+    }
+
+    pub fn subscriptions_for_coin(&self, kind: SubscriptionKind, coin: &str) -> impl Iterator<Item = &Subscription> {
+        self.subscriptions_by_coin
+            .get(&kind)
+            .and_then(|subscriptions| subscriptions.get(coin))
+            .into_iter()
+            .flat_map(|subscriptions| subscriptions.iter())
+    }
+
+    pub fn order_update_subscriptions_for_user(&self, user: Address) -> impl Iterator<Item = &Subscription> {
+        self.order_updates_by_user.get(&user).into_iter().flat_map(|subscriptions| subscriptions.iter())
+    }
+
+    pub fn subscription_count_for_type(&self, kind: SubscriptionKind) -> usize {
+        self.subscriptions_by_type.get(&kind).map_or(0, Vec::len)
+    }
+
+    pub fn active_subscriptions_for_fanout(&self, channel: FanoutChannel) -> usize {
+        match channel {
+            FanoutChannel::L2Book => self.subscription_count_for_type(SubscriptionKind::L2Book),
+            FanoutChannel::Bbo => self.subscription_count_for_type(SubscriptionKind::Bbo),
+            FanoutChannel::Trades => self.subscription_count_for_type(SubscriptionKind::Trades),
+            FanoutChannel::BookDiffs => self
+                .subscription_count_for_type(SubscriptionKind::BookDiffs)
+                .saturating_add(self.subscription_count_for_type(SubscriptionKind::L4Book)),
+            FanoutChannel::OrderStatuses => self
+                .subscription_count_for_type(SubscriptionKind::L4Book)
+                .saturating_add(self.subscription_count_for_type(SubscriptionKind::OrderUpdates)),
+        }
+    }
 }
 
 impl Drop for SubscriptionManager {
     fn drop(&mut self) {
         for sub in &self.subscriptions {
-            WS_SUBSCRIPTIONS_ACTIVE.with_label_values(&[sub.type_label()]).dec();
+            let kind = sub.kind();
+            TRANSPORT_SUBSCRIPTIONS_ACTIVE.with_label_values(&[self.transport.label(), kind.label()]).dec();
+            if self.transport.uses_legacy_websocket_metrics() {
+                WS_SUBSCRIPTIONS_ACTIVE.with_label_values(&[kind.label()]).dec();
+            }
         }
     }
 }
@@ -470,6 +674,37 @@ mod test {
         let _ = mgr.subscribe(Subscription::Bbo { coin: "BTC".to_string() });
         let _ = mgr.subscribe(Subscription::Trades { coin: "ETH".to_string() });
         assert_eq!(mgr.subscriptions().len(), 2);
+    }
+
+    #[test]
+    fn test_keyed_subscriptions_filter_by_kind_coin_and_user() {
+        let mut mgr = super::SubscriptionManager::default();
+        let _ = mgr.subscribe(Subscription::Trades { coin: "BTC".to_string() });
+        let _ = mgr.subscribe(Subscription::Trades { coin: "ETH".to_string() });
+        let _ = mgr.subscribe(Subscription::BookDiffs { coin: "BTC".to_string() });
+        let _ = mgr.subscribe(Subscription::L4Book { coin: "BTC".to_string() });
+        let _ = mgr.subscribe(Subscription::Bbo { coin: "BTC".to_string() });
+        let user = "0xABcDEF1234567890abcdef1234567890AbCdEf12".parse().unwrap();
+        let _ = mgr
+            .subscribe(Subscription::OrderUpdates { user: "0xABcDEF1234567890abcdef1234567890AbCdEf12".to_string() });
+
+        assert_eq!(mgr.active_subscriptions_for_fanout(super::FanoutChannel::Bbo), 1);
+        assert_eq!(mgr.active_subscriptions_for_fanout(super::FanoutChannel::Trades), 2);
+        assert_eq!(mgr.active_subscriptions_for_fanout(super::FanoutChannel::BookDiffs), 2);
+        assert_eq!(mgr.active_subscriptions_for_fanout(super::FanoutChannel::OrderStatuses), 2);
+
+        let btc_trades: Vec<_> = mgr.subscriptions_for_coin(super::SubscriptionKind::Trades, "BTC").collect();
+        assert_eq!(btc_trades.len(), 1);
+        assert!(matches!(btc_trades[0], Subscription::Trades { coin } if coin == "BTC"));
+
+        let eth_book_diffs: Vec<_> = mgr.subscriptions_for_coin(super::SubscriptionKind::BookDiffs, "ETH").collect();
+        assert!(eth_book_diffs.is_empty());
+
+        assert_eq!(mgr.order_update_subscriptions_for_user(user).count(), 1);
+
+        assert!(mgr.unsubscribe(Subscription::Trades { coin: "BTC".to_string() }));
+        assert_eq!(mgr.subscriptions_for_coin(super::SubscriptionKind::Trades, "BTC").count(), 0);
+        assert_eq!(mgr.subscriptions_for_coin(super::SubscriptionKind::Trades, "ETH").count(), 1);
     }
 
     #[test]

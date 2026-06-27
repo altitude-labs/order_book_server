@@ -47,7 +47,7 @@ pub struct ServerConfig {
     pub hlnode_binary: String,
     /// Path to abci_state.rmp file (direct mode only, has default)
     pub abci_state_path: Option<PathBuf>,
-    /// Path where snapshot will be written (direct mode only, has default)
+    /// Path where snapshot will be written (has a process-specific default)
     pub snapshot_output_path: Option<PathBuf>,
     /// Path to visor_abci_state.json (optional)
     pub visor_state_path: Option<PathBuf>,

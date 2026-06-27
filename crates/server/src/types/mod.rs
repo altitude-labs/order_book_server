@@ -91,6 +91,30 @@ impl L2Book {
     pub(crate) const fn set_time(&mut self, time: u64) {
         self.time = time;
     }
+
+    pub(crate) fn coin(&self) -> &str {
+        &self.coin
+    }
+
+    pub(crate) const fn time(&self) -> u64 {
+        self.time
+    }
+
+    pub(crate) const fn n_sig_figs(&self) -> Option<u32> {
+        self.n_sig_figs
+    }
+
+    pub(crate) const fn mantissa(&self) -> Option<u64> {
+        self.mantissa
+    }
+
+    pub(crate) const fn n_levels(&self) -> Option<usize> {
+        self.n_levels
+    }
+
+    pub(crate) const fn levels(&self) -> &[Vec<Level>; 2] {
+        &self.levels
+    }
 }
 
 impl Trade {
@@ -150,6 +174,10 @@ impl Trade {
         self.time
     }
 
+    pub fn latest_time(trades: &[Self]) -> Option<u64> {
+        trades.iter().map(Self::time).max()
+    }
+
     pub const fn tid(&self) -> u64 {
         self.tid
     }
@@ -195,6 +223,29 @@ pub struct L4Order {
     pub orig_sz: String,
     pub tif: Option<String>,
     pub cloid: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimeInForce {
+    ImmediateOrCancel,
+    Other,
+}
+
+impl TimeInForce {
+    #[must_use]
+    pub(crate) fn from_node_value(value: &str) -> Self {
+        match value {
+            "Ioc" => Self::ImmediateOrCancel,
+            _ => Self::Other,
+        }
+    }
+}
+
+impl L4Order {
+    #[must_use]
+    pub(crate) fn time_in_force(&self) -> Option<TimeInForce> {
+        self.tif.as_deref().map(TimeInForce::from_node_value)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

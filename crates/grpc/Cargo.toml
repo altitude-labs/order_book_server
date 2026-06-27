@@ -5,11 +5,9 @@ edition.workspace = true
 publish = false
 
 [dependencies]
-alloy.workspace = true
 chrono.workspace = true
 log.workspace = true
 prost.workspace = true
-rustc-hash.workspace = true
 serde_json.workspace = true
 server.workspace = true
 tokio.workspace = true

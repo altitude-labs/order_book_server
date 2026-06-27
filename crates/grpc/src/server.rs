@@ -1,19 +1,32 @@
 use crate::orderbook as pb;
 use log::{error, info};
+use prost::Message as _;
 use server::{
     Result, ServerConfig,
-    metrics::{BBO_CHANGES_TOTAL, BROADCASTS_TOTAL, MESSAGES_SENT_TOTAL, ORDERBOOK_HEIGHT, WS_SEND_ERRORS_TOTAL},
+    metrics::{
+        BBO_CHANGES_TOTAL, BROADCASTS_TOTAL, CHANNEL_DROPS_TOTAL, CHANNEL_LAG, LISTENER_LOCK_HOLD_LATENCY,
+        LISTENER_LOCK_WAIT_LATENCY, MESSAGES_SENT_TOTAL, ORDERBOOK_HEIGHT, PayloadTimestampKind,
+        TRANSPORT_CHANNEL_MESSAGES_SENT_TOTAL, TRANSPORT_CONNECTIONS_ACTIVE, TRANSPORT_CONNECTIONS_TOTAL,
+        TRANSPORT_FANOUT_ACTIVE_SUBSCRIPTIONS, TRANSPORT_FANOUT_LATENCY, TRANSPORT_FANOUT_SUBSCRIPTIONS,
+        TRANSPORT_MESSAGES_SENT_TOTAL, TRANSPORT_MESSAGES_SKIPPED_TOTAL, TRANSPORT_OUTGOING_QUEUE_DEPTH,
+        TRANSPORT_PAYLOAD_BUILD_LATENCY, TRANSPORT_PAYLOAD_BYTES, TRANSPORT_PAYLOAD_CACHE_TOTAL,
+        TRANSPORT_SEND_ERRORS_TOTAL, TRANSPORT_SEND_LATENCY, WS_SEND_ERRORS_TOTAL, observe_transport_event_egress_age,
+        observe_transport_payload_egress_age,
+    },
     transport::{
-        ActiveL2Params, ClientMessage, Coin, CoinBbo, CoinStatuses, DEFAULT_LEVELS, InnerLevel, InternalMessage,
-        L2ParamGuard, L2SnapshotParams, L4Order, Level, MAX_LEVELS, NodeDataOrderDiff, NodeDataOrderStatus,
-        OrderBookListener, OrderBookRuntime, OrderDiff, Side, Snapshot, Subscription, SubscriptionManager, Trade,
+        ActiveL2Params, ActiveSubscriptionInterests, ClientMessage, Coin, CoinBbo, DEFAULT_LEVELS, InnerLevel,
+        InternalMessage, L2BuiltFrame, L2FrameCache, L2ParamGuard, L2SnapshotParams, L4Order, Level, MAX_LEVELS,
+        NodeDataOrderDiff, NodeDataOrderStatus, OrderBookListener, OrderBookRuntime, OrderDiff, Side, Snapshot,
+        Subscription, SubscriptionInterest, SubscriptionInterestGuard, SubscriptionKind, SubscriptionManager, Trade,
+        TransportKind, UserStatuses,
     },
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
+    hash::{Hash, Hasher},
     pin::Pin,
     sync::{
-        Arc,
+        Arc, LazyLock, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -39,8 +52,68 @@ struct BboEntry {
     payload: Option<pb::Bbo>,
 }
 
-fn l2_cache_key(coin: &str, n_sig_figs: Option<u32>, mantissa: Option<u64>, n_levels: Option<usize>) -> String {
-    format!("{}:{}:{}:{}", coin, n_sig_figs.unwrap_or(0), mantissa.unwrap_or(0), n_levels.unwrap_or(DEFAULT_LEVELS))
+impl BboEntry {
+    fn upsert(cache: &mut HashMap<String, Self>, coin: &str, tuple: BboKey, payload: Option<pb::Bbo>) {
+        let entry = Self { tuple, last_sent: Instant::now(), payload };
+        if let Some(slot) = cache.get_mut(coin) {
+            *slot = entry;
+        } else {
+            cache.insert(coin.to_string(), entry);
+        }
+    }
+}
+
+const GRPC_PAYLOAD_CACHE_CAP: usize = 512;
+static GRPC_PAYLOAD_CACHE: LazyLock<StdMutex<GrpcPayloadCache>> =
+    LazyLock::new(|| StdMutex::new(GrpcPayloadCache::with_capacity(GRPC_PAYLOAD_CACHE_CAP)));
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct GrpcPayloadCacheKey {
+    source: usize,
+    channel: SubscriptionKind,
+    a: u64,
+    b: u64,
+}
+
+struct GrpcPayloadCache {
+    entries: HashMap<GrpcPayloadCacheKey, pb::ServerMessage>,
+    insertion_order: VecDeque<GrpcPayloadCacheKey>,
+    cap: usize,
+}
+
+impl GrpcPayloadCache {
+    fn with_capacity(cap: usize) -> Self {
+        Self { entries: HashMap::with_capacity(cap), insertion_order: VecDeque::with_capacity(cap), cap }
+    }
+
+    fn get(&self, key: &GrpcPayloadCacheKey) -> Option<pb::ServerMessage> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: GrpcPayloadCacheKey, message: pb::ServerMessage) {
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        self.entries.insert(key, message);
+        self.insertion_order.push_back(key);
+        while self.entries.len() > self.cap {
+            if let Some(old_key) = self.insertion_order.pop_front() {
+                self.entries.remove(&old_key);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+fn grpc_payload_key<T>(source: *const T, channel: SubscriptionKind, a: u64, b: u64) -> GrpcPayloadCacheKey {
+    GrpcPayloadCacheKey { source: source.cast::<()>() as usize, channel, a, b }
+}
+
+fn hash_value<T: Hash>(value: &T) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn build_heartbeat_ticker(l2book_heartbeat_ms: u64, bbo_heartbeat_ms: u64) -> Option<tokio::time::Interval> {
@@ -108,6 +181,8 @@ impl pb::orderbook_server::Orderbook for GrpcOrderbookService {
     ) -> std::result::Result<Response<Self::StreamStream>, Status> {
         let (tx, rx) = mpsc::channel(1024);
         self.active_connections.fetch_add(1, Ordering::Relaxed);
+        TRANSPORT_CONNECTIONS_ACTIVE.with_label_values(&["grpc"]).inc();
+        TRANSPORT_CONNECTIONS_TOTAL.with_label_values(&["grpc"]).inc();
 
         let state = GrpcConnectionState {
             incoming: request.into_inner(),
@@ -135,7 +210,12 @@ impl pb::orderbook_server::Orderbook for GrpcOrderbookService {
         &self,
         _request: Request<pb::HealthRequest>,
     ) -> std::result::Result<Response<pb::HealthResponse>, Status> {
-        let is_ready = self.listener.lock().await.is_ready();
+        let wait_start = Instant::now();
+        let guard = self.listener.lock().await;
+        LISTENER_LOCK_WAIT_LATENCY.with_label_values(&["grpc_health"]).observe(wait_start.elapsed().as_secs_f64());
+        let hold_start = Instant::now();
+        let is_ready = guard.is_ready();
+        LISTENER_LOCK_HOLD_LATENCY.with_label_values(&["grpc_health"]).observe(hold_start.elapsed().as_secs_f64());
         Ok(Response::new(pb::HealthResponse {
             status: if is_ready { "ready" } else { "initializing" }.to_string(),
             uptime_seconds: self.start_time.elapsed().as_secs(),
@@ -159,7 +239,16 @@ struct GrpcConnectionState {
 impl GrpcConnectionState {
     async fn run(mut self) {
         let _guard = GrpcConnectionGuard { active_connections: self.active_connections.clone() };
-        let is_ready = self.listener.lock().await.is_ready();
+        let wait_start = Instant::now();
+        let listener_guard = self.listener.lock().await;
+        LISTENER_LOCK_WAIT_LATENCY.with_label_values(&["grpc_setup"]).observe(wait_start.elapsed().as_secs_f64());
+        let hold_start = Instant::now();
+        let is_ready = listener_guard.is_ready();
+        let mut universe = listener_guard.universe();
+        let active_l2_params = listener_guard.active_l2_params();
+        let active_subscription_interests = listener_guard.active_subscription_interests();
+        LISTENER_LOCK_HOLD_LATENCY.with_label_values(&["grpc_setup"]).observe(hold_start.elapsed().as_secs_f64());
+        drop(listener_guard);
         if !is_ready {
             let _ = send_grpc_message(
                 &self.outgoing,
@@ -170,13 +259,12 @@ impl GrpcConnectionState {
         }
 
         let mut internal_message_rx = self.internal_message_tx.subscribe();
-        let mut manager = SubscriptionManager::default();
-        let mut universe = self.listener.lock().await.universe();
-        let mut last_l2: HashMap<String, L2Entry> = HashMap::new();
+        let mut manager = SubscriptionManager::new(TransportKind::Grpc);
+        let mut last_l2: HashMap<Subscription, L2Entry> = HashMap::new();
+        let mut uncached_l2: HashSet<Subscription> = HashSet::new();
         let mut last_bbo: HashMap<String, BboEntry> = HashMap::new();
-        let mut user_addrs: HashMap<String, alloy::primitives::Address> = HashMap::new();
-        let active_l2_params = self.listener.lock().await.active_l2_params();
         let mut l2_param_guards: HashMap<L2SnapshotParams, L2ParamGuard> = HashMap::new();
+        let mut subscription_interest_guards: HashMap<Subscription, SubscriptionInterestGuard> = HashMap::new();
         let mut heartbeat_ticker = build_heartbeat_ticker(self.l2book_heartbeat_ms, self.bbo_heartbeat_ms);
         let l2_hb =
             if self.l2book_heartbeat_ms > 0 { Some(Duration::from_millis(self.l2book_heartbeat_ms)) } else { None };
@@ -186,119 +274,211 @@ impl GrpcConnectionState {
         loop {
             select! {
                 recv_result = internal_message_rx.recv() => {
-                    let Ok(msg) = recv_result else {
-                        return;
+                    let msg = match recv_result {
+                        Ok(msg) => msg,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            CHANNEL_LAG.with_label_values(&["grpc"]).set(n as i64);
+                            CHANNEL_DROPS_TOTAL.with_label_values(&["grpc"]).inc();
+                            // A dropped Snapshot may have carried dirty coins
+                            // this connection never saw; process the next
+                            // snapshot in full and let hash dedup suppress
+                            // unchanged sends.
+                            force_full_l2 = true;
+                            log::debug!("gRPC receiver lagged: {n} messages");
+                            continue;
+                        }
+                        Err(err) => {
+                            error!("gRPC internal receiver error: {err}");
+                            return;
+                        }
                     };
+                    let fanout_start = Instant::now();
+                    let channel = msg.fanout_channel();
+                    let channel_label = channel.label();
+                    let active_fanout_subscriptions = manager.active_subscriptions_for_fanout(channel);
+                    let mut fanout_subscriptions = 0usize;
                     match msg.as_ref() {
-                        InternalMessage::Snapshot{ l2_snapshots, time, dirty, universe: new_universe, .. } => {
+                        InternalMessage::Snapshot{ l2_snapshots, time, dirty, universe: new_universe, l2_frames } => {
                             if let Some(u) = new_universe {
                                 universe = Arc::clone(u);
                             }
-                            for sub in manager.subscriptions() {
-                                if !matches!(sub, Subscription::Bbo { .. })
-                                    && !send_grpc_data_from_snapshot(&self.outgoing, sub, l2_snapshots.as_ref(), *time, &mut last_l2, dirty, force_full_l2, l2_hb.is_some()).await {
-                                    return;
+                            if force_full_l2 {
+                                fanout_subscriptions = manager.subscription_count_for_type(SubscriptionKind::L2Book);
+                                for sub in manager.subscriptions_for_type(SubscriptionKind::L2Book) {
+                                    if !send_grpc_data_from_snapshot(&self.outgoing, sub, l2_snapshots.as_ref(), *time, &mut last_l2, dirty, force_full_l2, l2_hb.is_some(), l2_frames).await {
+                                        return;
+                                    }
+                                    if last_l2.contains_key(sub) {
+                                        uncached_l2.remove(sub);
+                                    }
+                                }
+                            } else {
+                                for coin in dirty {
+                                    for sub in manager.subscriptions_for_coin(SubscriptionKind::L2Book, coin.as_str()) {
+                                        fanout_subscriptions += 1;
+                                        if !send_grpc_data_from_snapshot(&self.outgoing, sub, l2_snapshots.as_ref(), *time, &mut last_l2, dirty, force_full_l2, l2_hb.is_some(), l2_frames).await {
+                                            return;
+                                        }
+                                        if last_l2.contains_key(sub) {
+                                            uncached_l2.remove(sub);
+                                        }
+                                    }
+                                }
+                                let pending: Vec<Subscription> = uncached_l2
+                                    .iter()
+                                    .filter(|sub| match sub.coin_key() {
+                                        Some(coin) => !dirty.contains(coin),
+                                        None => true,
+                                    })
+                                    .cloned()
+                                    .collect();
+                                for sub in pending {
+                                    fanout_subscriptions += 1;
+                                    if !send_grpc_data_from_snapshot(&self.outgoing, &sub, l2_snapshots.as_ref(), *time, &mut last_l2, dirty, force_full_l2, l2_hb.is_some(), l2_frames).await {
+                                        return;
+                                    }
+                                    if last_l2.contains_key(&sub) {
+                                        uncached_l2.remove(&sub);
+                                    }
                                 }
                             }
                             force_full_l2 = false;
                         }
                         InternalMessage::BboUpdate{ bbos, time } => {
-                            for sub in manager.subscriptions() {
-                                if let Subscription::Bbo { coin } = sub
-                                    && !send_grpc_data_from_bbo(&self.outgoing, coin, bbos, *time, &mut last_bbo, bbo_hb.is_some()).await {
-                                    return;
+                            for (coin, bbo) in bbos.iter() {
+                                let coin = coin.as_str();
+                                for _sub in manager.subscriptions_for_coin(SubscriptionKind::Bbo, coin) {
+                                    fanout_subscriptions += 1;
+                                    if !send_grpc_data_from_bbo(&self.outgoing, coin, bbo, *time, &mut last_bbo, bbo_hb.is_some()).await {
+                                        return;
+                                    }
                                 }
                             }
                         }
                         InternalMessage::Fills{ trades_by_coin } => {
-                            for sub in manager.subscriptions() {
-                                if let Subscription::Trades { coin } = sub
-                                    && let Some(ct) = trades_by_coin.get(coin.as_str()) {
+                            for (coin, ct) in trades_by_coin.iter() {
+                                for _sub in manager.subscriptions_for_coin(SubscriptionKind::Trades, coin) {
+                                    fanout_subscriptions += 1;
                                     BROADCASTS_TOTAL.with_label_values(&["trades"]).inc();
-                                    if !send_grpc_message(&self.outgoing, trades_message(ct.trades.as_ref())).await {
+                                    if let Some(event_time_ms) = Trade::latest_time(ct.trades.as_ref()) {
+                                        observe_transport_event_egress_age(TransportKind::Grpc, SubscriptionKind::Trades, event_time_ms);
+                                        observe_transport_payload_egress_age(TransportKind::Grpc, SubscriptionKind::Trades, PayloadTimestampKind::TradeTime,
+                                            event_time_ms,
+                                        );
+                                    }
+                                    let cache_key = grpc_payload_key(
+                                        Arc::as_ptr(&ct.trades),
+                                        SubscriptionKind::Trades,
+                                        ct.trades.len() as u64,
+                                        Trade::latest_time(ct.trades.as_ref()).unwrap_or(0),
+                                    );
+                                    if !send_grpc_message(&self.outgoing, cached_grpc_message(cache_key, SubscriptionKind::Trades, || trades_message(ct.trades.as_ref()))).await {
                                         return;
                                     }
                                 }
                             }
                         }
                         InternalMessage::L4OrderDiffs{ time, height, diffs_by_coin } => {
-                            for sub in manager.subscriptions() {
-                                match sub {
-                                    Subscription::BookDiffs { coin } => {
-                                        if let Some(cd) = diffs_by_coin.get(coin.as_str()) {
-                                            BROADCASTS_TOTAL.with_label_values(&["bookDiffs"]).inc();
-                                            if !send_grpc_message(&self.outgoing, book_diffs_message(cd.diffs.as_ref())).await {
-                                                return;
-                                            }
-                                        }
+                            for (coin, cd) in diffs_by_coin.iter() {
+                                for _sub in manager.subscriptions_for_coin(SubscriptionKind::BookDiffs, coin) {
+                                    fanout_subscriptions += 1;
+                                    BROADCASTS_TOTAL.with_label_values(&["bookDiffs"]).inc();
+                                    observe_transport_event_egress_age(TransportKind::Grpc, SubscriptionKind::BookDiffs, *time);
+                                    let cache_key = grpc_payload_key(
+                                        Arc::as_ptr(&cd.diffs),
+                                        SubscriptionKind::BookDiffs,
+                                        *time,
+                                        *height ^ cd.diffs.len() as u64,
+                                    );
+                                    if !send_grpc_message(&self.outgoing, cached_grpc_message(cache_key, SubscriptionKind::BookDiffs, || book_diffs_message(cd.diffs.as_ref()))).await {
+                                        return;
                                     }
-                                    Subscription::L4Book { coin } => {
-                                        if let Some(cd) = diffs_by_coin.get(coin.as_str()) {
-                                            BROADCASTS_TOTAL.with_label_values(&["l4"]).inc();
-                                            if !send_grpc_message(&self.outgoing, l4_updates_message(*time, *height, &[], cd.diffs.as_ref())).await {
-                                                return;
-                                            }
-                                        }
+                                }
+                                for _sub in manager.subscriptions_for_coin(SubscriptionKind::L4Book, coin) {
+                                    fanout_subscriptions += 1;
+                                    BROADCASTS_TOTAL.with_label_values(&["l4"]).inc();
+                                    observe_transport_event_egress_age(TransportKind::Grpc, SubscriptionKind::L4Book, *time);
+                                    let cache_key = grpc_payload_key(
+                                        Arc::as_ptr(&cd.diffs),
+                                        SubscriptionKind::L4Book,
+                                        *time,
+                                        *height ^ cd.diffs.len() as u64,
+                                    );
+                                    if !send_grpc_message(&self.outgoing, cached_grpc_message(cache_key, SubscriptionKind::L4Book, || l4_updates_message(*time, *height, &[], cd.diffs.as_ref()))).await {
+                                        return;
                                     }
-                                    _ => {}
                                 }
                             }
                         }
-                        InternalMessage::L4OrderStatuses{ time, height, statuses_by_coin } => {
-                            for sub in manager.subscriptions() {
-                                match sub {
-                                    Subscription::L4Book { coin } => {
-                                        if let Some(cs) = statuses_by_coin.get(coin.as_str()) {
-                                            BROADCASTS_TOTAL.with_label_values(&["l4"]).inc();
-                                            if !send_grpc_message(&self.outgoing, l4_updates_message(*time, *height, cs.statuses.as_ref(), &[])).await {
-                                                return;
-                                            }
-                                        }
+                        InternalMessage::L4OrderStatuses{ time, height, statuses_by_coin, statuses_by_user } => {
+                            for (coin, cs) in statuses_by_coin.iter() {
+                                for _sub in manager.subscriptions_for_coin(SubscriptionKind::L4Book, coin) {
+                                    fanout_subscriptions += 1;
+                                    BROADCASTS_TOTAL.with_label_values(&["l4"]).inc();
+                                    observe_transport_event_egress_age(TransportKind::Grpc, SubscriptionKind::L4Book, *time);
+                                    let cache_key = grpc_payload_key(
+                                        Arc::as_ptr(&cs.statuses),
+                                        SubscriptionKind::L4Book,
+                                        *time,
+                                        *height ^ cs.statuses.len() as u64,
+                                    );
+                                    cs.timestamps.observe_transport_egress_age(TransportKind::Grpc, SubscriptionKind::L4Book);
+                                    if !send_grpc_message(&self.outgoing, cached_grpc_message(cache_key, SubscriptionKind::L4Book, || l4_updates_message(*time, *height, cs.statuses.as_ref(), &[]))).await {
+                                        return;
                                     }
-                                    Subscription::OrderUpdates { user } => {
-                                        if !send_grpc_order_updates(&self.outgoing, user, *time, *height, statuses_by_coin, &mut user_addrs).await {
-                                            return;
-                                        }
+                                }
+                            }
+                            for (user, statuses) in statuses_by_user.iter() {
+                                for _sub in manager.order_update_subscriptions_for_user(*user) {
+                                    fanout_subscriptions += 1;
+                                    if !send_grpc_order_updates(&self.outgoing, statuses, *time, *height).await {
+                                        return;
                                     }
-                                    _ => {}
                                 }
                             }
                         }
                     }
+                    TRANSPORT_FANOUT_SUBSCRIPTIONS
+                        .with_label_values(&["grpc", channel_label])
+                        .observe(fanout_subscriptions as f64);
+                    TRANSPORT_FANOUT_ACTIVE_SUBSCRIPTIONS
+                        .with_label_values(&["grpc", channel_label])
+                        .observe(active_fanout_subscriptions as f64);
+                    TRANSPORT_FANOUT_LATENCY
+                        .with_label_values(&["grpc", channel_label])
+                        .observe(fanout_start.elapsed().as_secs_f64());
                 }
                 _ = heartbeat_tick(&mut heartbeat_ticker) => {
                     let now = Instant::now();
                     let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
-                    for sub in manager.subscriptions() {
-                        match sub {
-                            Subscription::L2Book { coin, n_sig_figs, mantissa, n_levels } => {
-                                let Some(hb) = l2_hb else { continue };
-                                let key = l2_cache_key(coin, *n_sig_figs, *mantissa, *n_levels);
-                                if let Some(entry) = last_l2.get_mut(&key)
-                                    && now.duration_since(entry.last_sent) >= hb
-                                    && let Some(payload) = entry.payload.as_mut() {
-                                    payload.time = now_ms;
-                                    entry.last_sent = now;
-                                    BROADCASTS_TOTAL.with_label_values(&["l2_heartbeat"]).inc();
-                                    if !send_grpc_message(&self.outgoing, l2_book_message(payload.clone())).await {
-                                        return;
-                                    }
+                    for sub in manager.subscriptions_for_type(SubscriptionKind::L2Book) {
+                        if let Subscription::L2Book { .. } = sub {
+                            let Some(hb) = l2_hb else { continue };
+                            if let Some(entry) = last_l2.get_mut(sub)
+                                && now.duration_since(entry.last_sent) >= hb
+                                && let Some(payload) = entry.payload.as_mut() {
+                                payload.time = now_ms;
+                                entry.last_sent = now;
+                                BROADCASTS_TOTAL.with_label_values(&["l2_heartbeat"]).inc();
+                                if !send_grpc_message(&self.outgoing, build_grpc_message(SubscriptionKind::L2Book, || l2_book_message(payload.clone()))).await {
+                                    return;
                                 }
                             }
-                            Subscription::Bbo { coin } => {
-                                let Some(hb) = bbo_hb else { continue };
-                                if let Some(entry) = last_bbo.get_mut(coin)
-                                    && now.duration_since(entry.last_sent) >= hb
-                                    && let Some(payload) = entry.payload.as_mut() {
-                                    payload.time = now_ms;
-                                    entry.last_sent = now;
-                                    BROADCASTS_TOTAL.with_label_values(&["bbo_heartbeat"]).inc();
-                                    if !send_grpc_message(&self.outgoing, bbo_message(payload.clone())).await {
-                                        return;
-                                    }
+                        }
+                    }
+                    for sub in manager.subscriptions_for_type(SubscriptionKind::Bbo) {
+                        if let Subscription::Bbo { coin } = sub {
+                            let Some(hb) = bbo_hb else { continue };
+                            if let Some(entry) = last_bbo.get_mut(coin)
+                                && now.duration_since(entry.last_sent) >= hb
+                                && let Some(payload) = entry.payload.as_mut() {
+                                payload.time = now_ms;
+                                entry.last_sent = now;
+                                BROADCASTS_TOTAL.with_label_values(&["bbo_heartbeat"]).inc();
+                                if !send_grpc_message(&self.outgoing, build_grpc_message(SubscriptionKind::Bbo, || bbo_message(payload.clone()))).await {
+                                    return;
                                 }
                             }
-                            _ => {}
                         }
                     }
                 }
@@ -327,7 +507,23 @@ impl GrpcConnectionState {
                             }
                         }
                         other => {
-                            if !receive_grpc_client_message(&self.outgoing, &mut manager, other, &universe, self.listener.clone(), self.bbo_only, &mut last_l2, &mut last_bbo, &active_l2_params, &mut l2_param_guards).await {
+                            if !receive_grpc_client_message(
+                                &self.outgoing,
+                                &mut manager,
+                                other,
+                                &universe,
+                                self.listener.clone(),
+                                self.bbo_only,
+                                &mut last_l2,
+                                &mut uncached_l2,
+                                &mut last_bbo,
+                                &active_l2_params,
+                                &mut l2_param_guards,
+                                &active_subscription_interests,
+                                &mut subscription_interest_guards,
+                            )
+                            .await
+                            {
                                 return;
                             }
                         }
@@ -345,6 +541,7 @@ struct GrpcConnectionGuard {
 impl Drop for GrpcConnectionGuard {
     fn drop(&mut self) {
         self.active_connections.fetch_sub(1, Ordering::Relaxed);
+        TRANSPORT_CONNECTIONS_ACTIVE.with_label_values(&["grpc"]).dec();
     }
 }
 
@@ -356,10 +553,13 @@ async fn receive_grpc_client_message(
     universe: &HashSet<String>,
     listener: Arc<Mutex<OrderBookListener>>,
     bbo_only: bool,
-    last_l2: &mut HashMap<String, L2Entry>,
+    last_l2: &mut HashMap<Subscription, L2Entry>,
+    uncached_l2: &mut HashSet<Subscription>,
     last_bbo: &mut HashMap<String, BboEntry>,
     active_l2_params: &ActiveL2Params,
     l2_param_guards: &mut HashMap<L2SnapshotParams, L2ParamGuard>,
+    active_subscription_interests: &ActiveSubscriptionInterests,
+    subscription_interest_guards: &mut HashMap<Subscription, SubscriptionInterestGuard>,
 ) -> bool {
     let subscription = match &client_message {
         ClientMessage::Unsubscribe { subscription } | ClientMessage::Subscribe { subscription } => subscription.clone(),
@@ -383,6 +583,12 @@ async fn receive_grpc_client_message(
                 if inserted && let Subscription::L2Book { n_sig_figs, mantissa, .. } = &subscription {
                     let params = L2SnapshotParams::new(*n_sig_figs, *mantissa);
                     l2_param_guards.entry(params).or_insert_with(|| active_l2_params.acquire(params));
+                    uncached_l2.insert(subscription.clone());
+                }
+                if inserted && let Some(interest) = subscription_interest(&subscription) {
+                    subscription_interest_guards
+                        .entry(subscription.clone())
+                        .or_insert_with(|| active_subscription_interests.acquire(interest));
                 }
                 ("", inserted)
             }
@@ -394,8 +600,9 @@ async fn receive_grpc_client_message(
             let removed = manager.unsubscribe(subscription.clone());
             if removed {
                 match &subscription {
-                    Subscription::L2Book { coin, n_sig_figs, mantissa, n_levels } => {
-                        last_l2.remove(&l2_cache_key(coin, *n_sig_figs, *mantissa, *n_levels));
+                    Subscription::L2Book { n_sig_figs, mantissa, .. } => {
+                        last_l2.remove(&subscription);
+                        uncached_l2.remove(&subscription);
                         let params = L2SnapshotParams::new(*n_sig_figs, *mantissa);
                         let still_used = manager.subscriptions().iter().any(|s| {
                             matches!(s, Subscription::L2Book { n_sig_figs: nsf, mantissa: m, .. }
@@ -410,6 +617,7 @@ async fn receive_grpc_client_message(
                     }
                     _ => {}
                 }
+                subscription_interest_guards.remove(&subscription);
             }
             ("un", removed)
         }
@@ -422,6 +630,7 @@ async fn receive_grpc_client_message(
                 Ok(msg) => msg,
                 Err(err) => {
                     manager.unsubscribe(subscription.clone());
+                    subscription_interest_guards.remove(subscription);
                     return send_grpc_message(
                         outgoing,
                         error_message(&format!("Unable to grab order book snapshot: {err}")),
@@ -444,12 +653,28 @@ async fn receive_grpc_client_message(
     }
 }
 
+const fn subscription_interest(subscription: &Subscription) -> Option<SubscriptionInterest> {
+    match subscription {
+        Subscription::Bbo { .. } => Some(SubscriptionInterest::Bbo),
+        Subscription::Trades { .. } => Some(SubscriptionInterest::Trades),
+        Subscription::L4Book { .. } => Some(SubscriptionInterest::L4Book),
+        Subscription::BookDiffs { .. } => Some(SubscriptionInterest::BookDiffs),
+        Subscription::OrderUpdates { .. } => Some(SubscriptionInterest::OrderUpdates),
+        Subscription::L2Book { .. } => None,
+    }
+}
+
 async fn immediate_snapshot(
     subscription: &Subscription,
     listener: Arc<Mutex<OrderBookListener>>,
 ) -> Result<Option<pb::ServerMessage>> {
     if let Subscription::L4Book { coin } = subscription {
-        let snapshot = listener.lock().await.compute_snapshot_for_coin(&Coin::new(coin));
+        let wait_start = Instant::now();
+        let guard = listener.lock().await;
+        LISTENER_LOCK_WAIT_LATENCY.with_label_values(&["grpc_l4_snapshot"]).observe(wait_start.elapsed().as_secs_f64());
+        let hold_start = Instant::now();
+        let snapshot = guard.compute_snapshot_for_coin(&Coin::new(coin));
+        LISTENER_LOCK_HOLD_LATENCY.with_label_values(&["grpc_l4_snapshot"]).observe(hold_start.elapsed().as_secs_f64());
         if let Some((time, height, coin_snapshot)) = snapshot {
             let [bids, asks] = coin_snapshot
                 .as_ref()
@@ -473,20 +698,24 @@ async fn immediate_snapshot(
 async fn send_grpc_data_from_bbo(
     outgoing: &mpsc::Sender<std::result::Result<pb::ServerMessage, Status>>,
     coin: &str,
-    bbos: &HashMap<Coin, CoinBbo>,
+    cb: &CoinBbo,
     time: u64,
     last_bbo: &mut HashMap<String, BboEntry>,
     store_payload: bool,
 ) -> bool {
-    if let Some(cb) = bbos.get(coin) {
-        let (best_bid, best_ask) = (&cb.raw.0, &cb.raw.1);
-        let current: BboKey = (
-            best_bid.as_ref().map(|(px, sz, _)| (px.value(), sz.value())),
-            best_ask.as_ref().map(|(px, sz, _)| (px.value(), sz.value())),
-        );
+    let (best_bid, best_ask) = (&cb.raw.0, &cb.raw.1);
+    let current: BboKey = (
+        best_bid.as_ref().map(|(px, sz, _)| (px.value(), sz.value())),
+        best_ask.as_ref().map(|(px, sz, _)| (px.value(), sz.value())),
+    );
 
-        if last_bbo.get(coin).map(|e| e.tuple) != Some(current) {
-            let payload = pb::Bbo {
+    if last_bbo.get(coin).map(|e| e.tuple) != Some(current) {
+        BBO_CHANGES_TOTAL.with_label_values(&[coin]).inc();
+        BROADCASTS_TOTAL.with_label_values(&["bbo"]).inc();
+        observe_transport_event_egress_age(TransportKind::Grpc, SubscriptionKind::Bbo, time);
+        let cache_key = grpc_payload_key(cb, SubscriptionKind::Bbo, time, hash_value(&current));
+        let message = cached_grpc_message(cache_key, SubscriptionKind::Bbo, || {
+            bbo_message(pb::Bbo {
                 coin: coin.to_string(),
                 time,
                 bid: best_bid.as_ref().map(|(px, sz, n)| pb::Level {
@@ -499,17 +728,13 @@ async fn send_grpc_data_from_bbo(
                     sz: sz.to_str(),
                     n: u64::from(*n),
                 }),
-            };
-
-            BBO_CHANGES_TOTAL.with_label_values(&[coin]).inc();
-            BROADCASTS_TOTAL.with_label_values(&["bbo"]).inc();
-            last_bbo.insert(
-                coin.to_string(),
-                BboEntry { tuple: current, last_sent: Instant::now(), payload: store_payload.then(|| payload.clone()) },
-            );
-            return send_grpc_message(outgoing, bbo_message(payload)).await;
-        }
+            })
+        });
+        let payload = store_payload.then(|| bbo_payload_from_message(&message)).flatten();
+        BboEntry::upsert(last_bbo, coin, current, payload);
+        return send_grpc_message(outgoing, message).await;
     }
+    TRANSPORT_MESSAGES_SKIPPED_TOTAL.with_label_values(&["grpc", "bbo", "unchanged"]).inc();
     true
 }
 
@@ -519,14 +744,15 @@ async fn send_grpc_data_from_snapshot(
     subscription: &Subscription,
     snapshot: &HashMap<Coin, Arc<HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>>,
     time: u64,
-    last_l2: &mut HashMap<String, L2Entry>,
+    last_l2: &mut HashMap<Subscription, L2Entry>,
     dirty: &HashSet<Coin>,
     force_full: bool,
     store_payload: bool,
+    l2_frames: &L2FrameCache,
 ) -> bool {
     if let Subscription::L2Book { coin, n_sig_figs, n_levels, mantissa } = subscription {
-        let key = l2_cache_key(coin, *n_sig_figs, *mantissa, *n_levels);
-        if !force_full && !dirty.contains(coin.as_str()) && last_l2.contains_key(&key) {
+        if !force_full && !dirty.contains(coin.as_str()) && last_l2.contains_key(subscription) {
+            TRANSPORT_MESSAGES_SKIPPED_TOTAL.with_label_values(&["grpc", "l2Book", "not_dirty"]).inc();
             return true;
         }
 
@@ -541,72 +767,54 @@ async fn send_grpc_data_from_snapshot(
             }
             None => None,
         };
-        let exported: [Vec<Level>; 2] =
-            variant.map_or_else(|| [Vec::new(), Vec::new()], |v| v.truncate(n_levels).export_inner_snapshot());
+        let built = l2_frames.get_or_build(coin, *n_sig_figs, *mantissa, n_levels, time, variant);
+        let current_hash = built.hash();
 
-        use std::hash::{Hash, Hasher};
-        let mut hasher = rustc_hash::FxHasher::default();
-        exported.hash(&mut hasher);
-        let current_hash = hasher.finish();
-
-        if last_l2.get(&key).map(|e| e.hash) != Some(current_hash) {
-            let payload = pb::L2Book {
-                coin: coin.clone(),
-                time,
-                n_sig_figs: *n_sig_figs,
-                mantissa: *mantissa,
-                n_levels: Some(n_levels as u64),
-                bids: exported[0].iter().map(level_to_proto).collect(),
-                asks: exported[1].iter().map(level_to_proto).collect(),
-            };
+        if last_l2.get(subscription).map(|e| e.hash) != Some(current_hash) {
             BROADCASTS_TOTAL.with_label_values(&["l2"]).inc();
-            last_l2.insert(
-                key,
-                L2Entry {
-                    hash: current_hash,
-                    last_sent: Instant::now(),
-                    payload: store_payload.then(|| payload.clone()),
-                },
-            );
-            return send_grpc_message(outgoing, l2_book_message(payload)).await;
+            observe_transport_event_egress_age(TransportKind::Grpc, SubscriptionKind::L2Book, time);
+            let cache_key = grpc_payload_key(Arc::as_ptr(&built), SubscriptionKind::L2Book, time, current_hash);
+            let message = cached_grpc_message(cache_key, SubscriptionKind::L2Book, || {
+                l2_book_message(l2_book_from_rendered(&built))
+            });
+            let payload = store_payload.then(|| l2_payload_from_message(&message)).flatten();
+            last_l2.insert(subscription.clone(), L2Entry { hash: current_hash, last_sent: Instant::now(), payload });
+            return send_grpc_message(outgoing, message).await;
         }
+        TRANSPORT_MESSAGES_SKIPPED_TOTAL.with_label_values(&["grpc", "l2Book", "unchanged"]).inc();
     }
     true
 }
 
 async fn send_grpc_order_updates(
     outgoing: &mpsc::Sender<std::result::Result<pb::ServerMessage, Status>>,
-    user: &str,
+    statuses: &UserStatuses,
     time: u64,
     height: u64,
-    statuses_by_coin: &HashMap<String, CoinStatuses>,
-    user_addrs: &mut HashMap<String, alloy::primitives::Address>,
 ) -> bool {
-    let user_addr = match user_addrs.get(user) {
-        Some(addr) => *addr,
-        None => match user.parse::<alloy::primitives::Address>() {
-            Ok(addr) => {
-                user_addrs.insert(user.to_string(), addr);
-                addr
-            }
-            Err(_) => return true,
-        },
-    };
-
-    let updates: Vec<pb::OrderUpdate> = statuses_by_coin
-        .values()
-        .flat_map(|cs| cs.statuses.iter())
-        .filter(|status| status.user == user_addr)
-        .map(|status| pb::OrderUpdate {
-            user: status.user.to_string(),
+    if !statuses.statuses.is_empty() {
+        observe_transport_event_egress_age(TransportKind::Grpc, SubscriptionKind::OrderUpdates, time);
+        statuses.timestamps.observe_transport_egress_age(TransportKind::Grpc, SubscriptionKind::OrderUpdates);
+        let cache_key = grpc_payload_key(
+            Arc::as_ptr(&statuses.statuses),
+            SubscriptionKind::OrderUpdates,
             time,
-            height,
-            order_status: Some(order_status_to_proto(status)),
-        })
-        .collect();
-
-    if !updates.is_empty() {
-        return send_grpc_message(outgoing, order_updates_message(updates)).await;
+            height ^ statuses.statuses.len() as u64,
+        );
+        let message = cached_grpc_message(cache_key, SubscriptionKind::OrderUpdates, || {
+            let updates: Vec<pb::OrderUpdate> = statuses
+                .statuses
+                .iter()
+                .map(|status| pb::OrderUpdate {
+                    user: status.user.to_string(),
+                    time,
+                    height,
+                    order_status: Some(order_status_to_proto(status)),
+                })
+                .collect();
+            order_updates_message(updates)
+        });
+        return send_grpc_message(outgoing, message).await;
     }
     true
 }
@@ -615,17 +823,83 @@ async fn send_grpc_message(
     outgoing: &mpsc::Sender<std::result::Result<pb::ServerMessage, Status>>,
     message: pb::ServerMessage,
 ) -> bool {
+    let channel = server_message_channel(&message);
+    let send_start = Instant::now();
+    let queued = outgoing.max_capacity().saturating_sub(outgoing.capacity());
+    TRANSPORT_OUTGOING_QUEUE_DEPTH.with_label_values(&["grpc"]).observe(queued as f64);
     match outgoing.send(Ok(message)).await {
         Ok(()) => {
+            TRANSPORT_SEND_LATENCY.with_label_values(&["grpc"]).observe(send_start.elapsed().as_secs_f64());
             MESSAGES_SENT_TOTAL.inc();
+            TRANSPORT_MESSAGES_SENT_TOTAL.with_label_values(&["grpc"]).inc();
+            TRANSPORT_CHANNEL_MESSAGES_SENT_TOTAL.with_label_values(&["grpc", channel]).inc();
             true
         }
         Err(err) => {
+            TRANSPORT_SEND_LATENCY.with_label_values(&["grpc"]).observe(send_start.elapsed().as_secs_f64());
             error!("Failed to send gRPC stream message: {err}");
             WS_SEND_ERRORS_TOTAL.inc();
+            TRANSPORT_SEND_ERRORS_TOTAL.with_label_values(&["grpc", "closed"]).inc();
             false
         }
     }
+}
+
+fn server_message_channel(message: &pb::ServerMessage) -> &'static str {
+    match message.message.as_ref() {
+        Some(pb::server_message::Message::SubscriptionResponse(_)) => "subscriptionResponse",
+        Some(pb::server_message::Message::L2Book(_)) => "l2Book",
+        Some(pb::server_message::Message::L4Book(_)) => "l4Book",
+        Some(pb::server_message::Message::Trades(_)) => "trades",
+        Some(pb::server_message::Message::Bbo(_)) => "bbo",
+        Some(pb::server_message::Message::BookDiffs(_)) => "bookDiffs",
+        Some(pb::server_message::Message::OrderUpdates(_)) => "orderUpdates",
+        Some(pb::server_message::Message::Pong(_)) => "pong",
+        Some(pb::server_message::Message::Error(_)) => "error",
+        None => "unknown",
+    }
+}
+
+fn build_grpc_message(channel: SubscriptionKind, build: impl FnOnce() -> pb::ServerMessage) -> pb::ServerMessage {
+    let build_start = Instant::now();
+    finish_grpc_message(channel, build_start, build())
+}
+
+fn cached_grpc_message(
+    key: GrpcPayloadCacheKey,
+    channel: SubscriptionKind,
+    build: impl FnOnce() -> pb::ServerMessage,
+) -> pb::ServerMessage {
+    if let Ok(cache) = GRPC_PAYLOAD_CACHE.lock()
+        && let Some(message) = cache.get(&key)
+    {
+        TRANSPORT_PAYLOAD_CACHE_TOTAL.with_label_values(&[TransportKind::Grpc.label(), channel.label(), "hit"]).inc();
+        TRANSPORT_PAYLOAD_BYTES
+            .with_label_values(&[TransportKind::Grpc.label(), channel.label()])
+            .observe(message.encoded_len() as f64);
+        return message;
+    }
+
+    TRANSPORT_PAYLOAD_CACHE_TOTAL.with_label_values(&[TransportKind::Grpc.label(), channel.label(), "miss"]).inc();
+    let message = build_grpc_message(channel, build);
+    if let Ok(mut cache) = GRPC_PAYLOAD_CACHE.lock() {
+        cache.insert(key, message.clone());
+    }
+    message
+}
+
+fn finish_grpc_message(
+    channel: SubscriptionKind,
+    build_start: Instant,
+    message: pb::ServerMessage,
+) -> pb::ServerMessage {
+    TRANSPORT_PAYLOAD_BUILD_LATENCY
+        .with_label_values(&[TransportKind::Grpc.label(), channel.label()])
+        .observe(build_start.elapsed().as_secs_f64());
+    TRANSPORT_PAYLOAD_BYTES
+        .with_label_values(&[TransportKind::Grpc.label(), channel.label()])
+        .observe(message.encoded_len() as f64);
+    message
 }
 
 fn client_message_from_proto(message: pb::ClientMessage) -> std::result::Result<ClientMessage, String> {
@@ -708,6 +982,18 @@ fn side_to_proto(side: Side) -> i32 {
 
 fn level_to_proto(level: &Level) -> pb::Level {
     pb::Level { px: level.px().to_string(), sz: level.sz().to_string(), n: level.n() as u64 }
+}
+
+fn l2_book_from_rendered(rendered: &L2BuiltFrame) -> pb::L2Book {
+    pb::L2Book {
+        coin: rendered.coin().to_string(),
+        time: rendered.time(),
+        n_sig_figs: rendered.n_sig_figs(),
+        mantissa: rendered.mantissa(),
+        n_levels: rendered.n_levels().map(|n| n as u64),
+        bids: rendered.levels()[0].iter().map(level_to_proto).collect(),
+        asks: rendered.levels()[1].iter().map(level_to_proto).collect(),
+    }
 }
 
 fn l4_order_to_proto(order: &L4Order) -> pb::L4Order {
@@ -817,6 +1103,20 @@ fn trades_message(trades: &[Trade]) -> pb::ServerMessage {
 
 fn bbo_message(bbo: pb::Bbo) -> pb::ServerMessage {
     pb::ServerMessage { message: Some(pb::server_message::Message::Bbo(bbo)) }
+}
+
+fn bbo_payload_from_message(message: &pb::ServerMessage) -> Option<pb::Bbo> {
+    match message.message.as_ref()? {
+        pb::server_message::Message::Bbo(payload) => Some(payload.clone()),
+        _ => None,
+    }
+}
+
+fn l2_payload_from_message(message: &pb::ServerMessage) -> Option<pb::L2Book> {
+    match message.message.as_ref()? {
+        pb::server_message::Message::L2Book(payload) => Some(payload.clone()),
+        _ => None,
+    }
 }
 
 fn book_diffs_message(diffs: &[NodeDataOrderDiff]) -> pb::ServerMessage {

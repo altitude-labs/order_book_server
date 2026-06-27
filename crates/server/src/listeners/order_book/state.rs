@@ -1,5 +1,9 @@
 use crate::{
     listeners::order_book::L2Snapshots,
+    metrics::{
+        MAINTENANCE_STAGE_LATENCY, ORDERBOOK_PRICE_LEVEL_SLAB_NODES, ORDERBOOK_PRICE_LEVEL_SLABS_COMPACTED_TOTAL,
+        PENDING_CACHE_EVICTIONS_TOTAL,
+    },
     order_book::{
         Coin, InnerOrder, Oid, Snapshot,
         multi_book::{OrderBooks, Snapshots},
@@ -145,45 +149,72 @@ impl OrderBookState {
         const MAX_PENDING_DIFFS: usize = 10_000;
         const PENDING_MAX_AGE: Duration = Duration::from_secs(60);
 
+        let maintenance_start = Instant::now();
         let mut cleared = false;
 
+        let stage_start = Instant::now();
         let before = self.pending_order_statuses.len();
         self.pending_order_statuses.retain(|_, (_, at)| at.elapsed() < PENDING_MAX_AGE);
         let aged_statuses = before - self.pending_order_statuses.len();
+        MAINTENANCE_STAGE_LATENCY
+            .with_label_values(&["pending_order_statuses_retain"])
+            .observe(stage_start.elapsed().as_secs_f64());
         if aged_statuses > 0 {
             // Expected orphans (order never rested -> no New diff): not data loss.
             log::info!("Evicted {aged_statuses} aged pending_order_statuses entries (no matching BookDiff)");
+            PENDING_CACHE_EVICTIONS_TOTAL
+                .with_label_values(&["pending_order_statuses", "aged"])
+                .inc_by(aged_statuses as u64);
         }
 
+        let stage_start = Instant::now();
         let before = self.pending_new_diffs.len();
         self.pending_new_diffs.retain(|_, (_, at)| at.elapsed() < PENDING_MAX_AGE);
         let aged_diffs = before - self.pending_new_diffs.len();
+        MAINTENANCE_STAGE_LATENCY
+            .with_label_values(&["pending_new_diffs_retain"])
+            .observe(stage_start.elapsed().as_secs_f64());
         if aged_diffs > 0 {
             // A New diff with no status in 60s: the order is missing from the book.
             log::warn!("Evicted {aged_diffs} aged pending_new_diffs entries (status never arrived - data loss)");
+            PENDING_CACHE_EVICTIONS_TOTAL.with_label_values(&["pending_new_diffs", "aged"]).inc_by(aged_diffs as u64);
             cleared = true;
         }
 
         if self.pending_order_statuses.len() > MAX_PENDING_ORDERS {
+            let evicted = self.pending_order_statuses.len();
             log::warn!(
                 "Clearing stale pending_order_statuses cache: {} entries (orphaned orders without matching BookDiffs)",
-                self.pending_order_statuses.len()
+                evicted
             );
             self.pending_order_statuses = HashMap::new();
+            PENDING_CACHE_EVICTIONS_TOTAL
+                .with_label_values(&["pending_order_statuses", "force_clear"])
+                .inc_by(evicted as u64);
             cleared = true;
         }
 
         if self.pending_new_diffs.len() > MAX_PENDING_DIFFS {
-            log::warn!("Clearing stale pending_new_diffs cache: {} entries", self.pending_new_diffs.len());
+            let evicted = self.pending_new_diffs.len();
+            log::warn!("Clearing stale pending_new_diffs cache: {} entries", evicted);
             self.pending_new_diffs = HashMap::new();
+            PENDING_CACHE_EVICTIONS_TOTAL
+                .with_label_values(&["pending_new_diffs", "force_clear"])
+                .inc_by(evicted as u64);
             cleared = true;
         }
 
+        let stage_start = Instant::now();
         let compacted = self.order_book.compact_all();
+        MAINTENANCE_STAGE_LATENCY.with_label_values(&["slab_compact"]).observe(stage_start.elapsed().as_secs_f64());
+        let (live, cap) = self.order_book.slab_stats();
+        ORDERBOOK_PRICE_LEVEL_SLAB_NODES.with_label_values(&["live"]).set(live as i64);
+        ORDERBOOK_PRICE_LEVEL_SLAB_NODES.with_label_values(&["capacity"]).set(cap as i64);
         if compacted > 0 {
-            let (live, cap) = self.order_book.slab_stats();
+            ORDERBOOK_PRICE_LEVEL_SLABS_COMPACTED_TOTAL.inc_by(compacted as u64);
             log::info!("Compacted {compacted} price-level slabs (live={live}, capacity={cap})");
         }
+        MAINTENANCE_STAGE_LATENCY.with_label_values(&["total"]).observe(maintenance_start.elapsed().as_secs_f64());
         cleared
     }
 
@@ -212,7 +243,7 @@ impl OrderBookState {
     pub(super) fn apply_order_statuses_hft(&mut self, batch: Batch<NodeDataOrderStatus>) -> Result<HashSet<Coin>> {
         let height = batch.block_number();
         let time = batch.block_time();
-        let mut changed_coins = HashSet::new();
+        let mut changed_coins = HashSet::with_capacity(batch.events_len().min(256));
 
         // Update height/time to track progress (>= ensures time updates even at same height)
         if height >= self.height {
@@ -271,7 +302,7 @@ impl OrderBookState {
     pub(super) fn apply_order_diffs_hft(&mut self, batch: Batch<NodeDataOrderDiff>) -> Result<HashSet<Coin>> {
         let height = batch.block_number();
         let time = batch.block_time();
-        let mut changed_coins = HashSet::new();
+        let mut changed_coins = HashSet::with_capacity(batch.events_len().min(256));
 
         // Update height/time to track progress (>= ensures time updates even at same height)
         if height >= self.height {

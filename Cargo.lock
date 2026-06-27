@@ -2199,12 +2199,10 @@ dependencies = [
 name = "grpc"
 version = "0.1.0"
 dependencies = [
- "alloy",
  "chrono",
  "log",
  "prost",
  "protoc-bin-vendored",
- "rustc-hash",
  "serde_json",
  "server",
  "tokio",

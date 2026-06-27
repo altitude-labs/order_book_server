@@ -1,7 +1,10 @@
 // HFT-optimized parallel file watcher
 // Each event source runs on its own thread for maximum throughput
 
-use crate::types::node_data::EventSource;
+use crate::{
+    metrics::{FILE_WATCHER_ENQUEUE_LATENCY, FILE_WATCHER_HANDOFF_AGE},
+    types::node_data::EventSource,
+};
 use log::{error, info};
 use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 use std::{
@@ -13,12 +16,12 @@ use std::{
         atomic::{AtomicU64, Ordering as AtomicOrdering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-/// Message sent from file watcher threads to the main processor
+/// Watcher event payload sent from file watcher threads to the main processor.
 #[derive(Debug)]
-pub(crate) enum FileEvent {
+pub(crate) enum FileEventKind {
     OrderStatus(String),
     OrderDiff(String),
     Fill(String),
@@ -32,6 +35,50 @@ pub(crate) enum FileEvent {
     /// The watcher had to discard buffered data (oversized partial line). The
     /// book may have missed events and must be re-synced from a snapshot.
     Desync(EventSource),
+}
+
+impl FileEventKind {
+    #[must_use]
+    pub(crate) const fn source(&self) -> EventSource {
+        match self {
+            Self::OrderStatus(_) | Self::BackfillOrderStatus(_) => EventSource::OrderStatuses,
+            Self::OrderDiff(_) | Self::BackfillOrderDiff(_) => EventSource::OrderDiffs,
+            Self::Fill(_) => EventSource::Fills,
+            Self::Desync(source) => *source,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn kind_label(&self) -> &'static str {
+        match self {
+            Self::OrderStatus(_) | Self::OrderDiff(_) | Self::Fill(_) => "live",
+            Self::BackfillOrderStatus(_) | Self::BackfillOrderDiff(_) => "backfill",
+            Self::Desync(_) => "desync",
+        }
+    }
+}
+
+/// File watcher event plus the time it entered the bounded handoff path.
+#[derive(Debug)]
+pub(crate) struct FileEvent {
+    enqueued_at: Instant,
+    kind: FileEventKind,
+}
+
+impl FileEvent {
+    fn new(kind: FileEventKind) -> Self {
+        Self { enqueued_at: Instant::now(), kind }
+    }
+
+    pub(crate) fn observe_handoff_age(&self) {
+        FILE_WATCHER_HANDOFF_AGE
+            .with_label_values(&[self.kind.source().metric_label(), self.kind.kind_label()])
+            .observe(self.enqueued_at.elapsed().as_secs_f64());
+    }
+
+    pub(crate) fn into_kind(self) -> FileEventKind {
+        self.kind
+    }
 }
 
 /// Cheap block-height extraction without a full JSON parse: streaming lines
@@ -70,6 +117,20 @@ pub(super) fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+fn send_file_event(
+    tx: &tokio::sync::mpsc::Sender<FileEvent>,
+    source: EventSource,
+    kind: &'static str,
+    event: FileEventKind,
+) -> bool {
+    let send_start = Instant::now();
+    let ok = tx.blocking_send(FileEvent::new(event)).is_ok();
+    FILE_WATCHER_ENQUEUE_LATENCY
+        .with_label_values(&[source.metric_label(), kind])
+        .observe(send_start.elapsed().as_secs_f64());
+    ok
 }
 
 /// File reader state for a single source
@@ -522,19 +583,19 @@ pub(super) fn spawn_file_watcher(
             let mut sent = 0_usize;
             let channel_open = reader.backfill_and_track(backfill_min_height, &mut |line| {
                 let evt = match source {
-                    EventSource::OrderStatuses => FileEvent::BackfillOrderStatus(line),
-                    EventSource::OrderDiffs => FileEvent::BackfillOrderDiff(line),
+                    EventSource::OrderStatuses => FileEventKind::BackfillOrderStatus(line),
+                    EventSource::OrderDiffs => FileEventKind::BackfillOrderDiff(line),
                     EventSource::Fills => unreachable!("fills are excluded from backfill"),
                 };
                 sent += 1;
-                tx.blocking_send(evt).is_ok()
+                send_file_event(&tx, source, "backfill", evt)
             });
             if !channel_open {
                 error!("{source_name} channel closed during backfill, exiting");
                 return;
             }
             info!("{source_name} backfill complete: {sent} lines above height {backfill_min_height}");
-            if reader.take_desynced() && tx.blocking_send(FileEvent::Desync(source)).is_err() {
+            if reader.take_desynced() && !send_file_event(&tx, source, "desync", FileEventKind::Desync(source)) {
                 error!("{source_name} channel closed, exiting");
                 return;
             }
@@ -563,11 +624,11 @@ pub(super) fn spawn_file_watcher(
                             let old_lines = reader.on_create(path);
                             for line in old_lines {
                                 let evt = match source {
-                                    EventSource::OrderStatuses => FileEvent::OrderStatus(line),
-                                    EventSource::OrderDiffs => FileEvent::OrderDiff(line),
-                                    EventSource::Fills => FileEvent::Fill(line),
+                                    EventSource::OrderStatuses => FileEventKind::OrderStatus(line),
+                                    EventSource::OrderDiffs => FileEventKind::OrderDiff(line),
+                                    EventSource::Fills => FileEventKind::Fill(line),
                                 };
-                                if tx.blocking_send(evt).is_err() {
+                                if !send_file_event(&tx, source, "live", evt) {
                                     error!("{} channel closed, exiting", source_name);
                                     return;
                                 }
@@ -582,12 +643,12 @@ pub(super) fn spawn_file_watcher(
                         let lines = reader.on_modify();
                         for line in lines {
                             let event = match source {
-                                EventSource::OrderStatuses => FileEvent::OrderStatus(line),
-                                EventSource::OrderDiffs => FileEvent::OrderDiff(line),
-                                EventSource::Fills => FileEvent::Fill(line),
+                                EventSource::OrderStatuses => FileEventKind::OrderStatus(line),
+                                EventSource::OrderDiffs => FileEventKind::OrderDiff(line),
+                                EventSource::Fills => FileEventKind::Fill(line),
                             };
 
-                            if tx.blocking_send(event).is_err() {
+                            if !send_file_event(&tx, source, "live", event) {
                                 error!("{} channel closed, exiting", source_name);
                                 return;
                             }
@@ -606,12 +667,12 @@ pub(super) fn spawn_file_watcher(
                     let lines = reader.on_modify();
                     for line in lines {
                         let event = match source {
-                            EventSource::OrderStatuses => FileEvent::OrderStatus(line),
-                            EventSource::OrderDiffs => FileEvent::OrderDiff(line),
-                            EventSource::Fills => FileEvent::Fill(line),
+                            EventSource::OrderStatuses => FileEventKind::OrderStatus(line),
+                            EventSource::OrderDiffs => FileEventKind::OrderDiff(line),
+                            EventSource::Fills => FileEventKind::Fill(line),
                         };
 
-                        if tx.blocking_send(event).is_err() {
+                        if !send_file_event(&tx, source, "live", event) {
                             error!("{} channel closed, exiting", source_name);
                             return;
                         }
@@ -627,7 +688,7 @@ pub(super) fn spawn_file_watcher(
 
             // If the reader had to discard buffered data, tell the listener so it
             // can re-sync the book from a fresh snapshot.
-            if reader.take_desynced() && tx.blocking_send(FileEvent::Desync(source)).is_err() {
+            if reader.take_desynced() && !send_file_event(&tx, source, "desync", FileEventKind::Desync(source)) {
                 error!("{source_name} channel closed, exiting");
                 return;
             }
@@ -657,11 +718,11 @@ pub(super) fn spawn_file_watcher(
                     let old_lines = reader.on_create(&newer_file);
                     for line in old_lines {
                         let evt = match source {
-                            EventSource::OrderStatuses => FileEvent::OrderStatus(line),
-                            EventSource::OrderDiffs => FileEvent::OrderDiff(line),
-                            EventSource::Fills => FileEvent::Fill(line),
+                            EventSource::OrderStatuses => FileEventKind::OrderStatus(line),
+                            EventSource::OrderDiffs => FileEventKind::OrderDiff(line),
+                            EventSource::Fills => FileEventKind::Fill(line),
                         };
-                        if tx.blocking_send(evt).is_err() {
+                        if !send_file_event(&tx, source, "live", evt) {
                             error!("{} channel closed, exiting", source_name);
                             return;
                         }

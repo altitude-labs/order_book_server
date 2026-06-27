@@ -7,8 +7,9 @@ use tokio::sync::{Mutex, broadcast::Sender};
 
 use crate::ServerConfig;
 pub use crate::listeners::order_book::{
-    ActiveL2Params, CoinBbo, CoinDiffs, CoinStatuses, InternalMessage, L2ParamGuard, L2SnapshotParams,
-    OrderBookListener, RawBbo, hl_listen_hft,
+    ActiveL2Params, ActiveSubscriptionInterests, CoinBbo, CoinDiffs, CoinStatuses, CoinTrades, InternalMessage,
+    L2BuiltFrame, L2FrameCache, L2ParamGuard, L2SnapshotParams, OrderBookListener, OrderStatusPayloadTimestamps,
+    RawBbo, SubscriptionInterest, SubscriptionInterestGuard, UserStatuses, hl_listen_hft,
 };
 pub use crate::order_book::{
     Snapshot,
@@ -18,7 +19,10 @@ pub use crate::types::{
     L4Order, Level, OrderDiff, Trade,
     inner::InnerLevel,
     node_data::{NodeDataOrderDiff, NodeDataOrderStatus},
-    subscription::{ClientMessage, DEFAULT_LEVELS, MAX_LEVELS, Subscription, SubscriptionManager},
+    subscription::{
+        ClientMessage, DEFAULT_LEVELS, FanoutChannel, MAX_LEVELS, Subscription, SubscriptionKind, SubscriptionManager,
+        TransportKind,
+    },
 };
 
 /// Shared order-book runtime consumed by one or more frontend transports.
@@ -44,11 +48,17 @@ impl OrderBookRuntime {
         let market_filter = (config.include_perps, config.include_spot, config.include_hip3);
         let ignore_spot = !config.include_spot;
         let active_l2_params = ActiveL2Params::new();
+        let active_subscription_interests = ActiveSubscriptionInterests::new();
 
         let listener = {
             let internal_message_tx = internal_message_tx.clone();
-            let mut listener =
-                OrderBookListener::new(Some(internal_message_tx), ignore_spot, active_l2_params, market_filter);
+            let mut listener = OrderBookListener::new(
+                Some(internal_message_tx),
+                ignore_spot,
+                active_l2_params,
+                active_subscription_interests,
+                market_filter,
+            );
             listener.set_tolerate_drift(config.no_resync);
             listener
         };

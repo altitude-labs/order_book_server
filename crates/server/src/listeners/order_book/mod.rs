@@ -1,27 +1,39 @@
 use crate::{
     listeners::order_book::state::OrderBookState,
     metrics::{
-        BBO_BROADCAST_LATENCY, EVENT_PROCESSING_LATENCY, EVENTS_PROCESSED_TOTAL, FILE_EVENTS_TOTAL,
-        FILE_LINES_PARSED_TOTAL, L2_BROADCAST_LATENCY, L2_CONFLATION_BATCH_SIZE, ORDERBOOK_COINS_COUNT,
-        ORDERBOOK_DESYNCS_TOTAL, ORDERBOOK_HEIGHT, ORDERBOOK_ORDERS_TOTAL, ORDERBOOK_TIME_MS, PARSE_ERRORS_TOTAL,
-        PENDING_DIFFS_CACHE, PENDING_ORDERS_CACHE, TRADES_UNPAIRED_FILLS_TOTAL,
+        BBO_BROADCAST_LATENCY, BROADCAST_PREP_SKIPPED_TOTAL, BROADCAST_RECEIVERS, EVENT_BATCH_SIZE,
+        EVENT_PROCESSING_LATENCY, EVENTS_PROCESSED_TOTAL, FILE_EVENTS_TOTAL, FILE_LINES_PARSED_TOTAL,
+        FILE_PARSE_LATENCY, FILE_WATCHER_RECV_BATCH_SIZE, INTERNAL_BROADCAST_PAYLOAD_EVENTS,
+        INTERNAL_BROADCAST_PAYLOAD_GROUPS, INTERNAL_BROADCAST_RECEIVERS, INTERNAL_BROADCAST_SEND_ERRORS_TOTAL,
+        INTERNAL_BROADCAST_SEND_LATENCY, L2_ACTIVE_VARIANTS, L2_BROADCAST_LATENCY, L2_CACHE_COINS,
+        L2_CONFLATION_BATCH_SIZE, L2_FLUSH_STAGE_LATENCY, L2_RECOMPUTED_COINS, LISTENER_LOCK_HOLD_LATENCY,
+        LISTENER_LOCK_WAIT_LATENCY, LISTENER_STAGE_LATENCY, ORDERBOOK_COINS_COUNT, ORDERBOOK_DESYNCS_TOTAL,
+        ORDERBOOK_HEIGHT, ORDERBOOK_ORDERS_TOTAL, ORDERBOOK_TIME_MS, PARSE_ERRORS_TOTAL, PENDING_DIFFS_CACHE,
+        PENDING_ORDERS_CACHE, SNAPSHOT_FETCH_PENDING, SNAPSHOT_FETCH_TOTAL, SNAPSHOT_REPLAY_CACHE_EVENTS,
+        SNAPSHOT_REPLAY_EVENTS, SNAPSHOT_STAGE_LATENCY, STATE_APPLY_CHANGED_COINS, WIRE_FRAME_BUILD_ERRORS_TOTAL,
+        WIRE_FRAME_BUILD_LATENCY, WIRE_FRAME_BYTES, WIRE_FRAME_CACHE_TOTAL, observe_source_event_age,
     },
     order_book::{
-        Coin, Px, Side, Snapshot, Sz,
+        Coin, Px, Snapshot, Sz,
         multi_book::{Snapshots, load_snapshots_from_cli_json},
     },
     prelude::*,
     types::{
-        L2Book, L4Order, Trade,
+        L2Book, L4Order,
         inner::{InnerL4Order, InnerLevel},
         node_data::{Batch, EventSource, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
+        subscription::{FanoutChannel, ServerResponse},
     },
 };
 use alloy::primitives::Address;
 use log::{error, info};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::Arc,
+    hash::{Hash, Hasher},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -48,8 +60,13 @@ const L2_FLUSH_TICK_MS: u64 = 10;
 const MAX_CACHED_EVENTS: usize = 1_000_000;
 
 mod parallel;
+mod payload_groups;
+mod payload_timestamps;
 mod state;
 mod utils;
+pub use payload_groups::{CoinDiffs, CoinStatuses, CoinTrades, UserStatuses};
+pub use payload_timestamps::OrderStatusPayloadTimestamps;
+pub(super) use payload_timestamps::OrderStatusTimestampSlice;
 
 fn fetch_snapshot(
     snapshot_config: SnapshotConfig,
@@ -66,16 +83,28 @@ fn fetch_snapshot(
         // the existing state here: it's discarded by init_from_snapshot below,
         // and cloning the whole BTreeMap/Slab tree temporarily doubles peak RSS.)
         {
+            let wait_start = Instant::now();
             let mut listener = listener.lock().await;
+            LISTENER_LOCK_WAIT_LATENCY
+                .with_label_values(&["snapshot_begin_caching"])
+                .observe(wait_start.elapsed().as_secs_f64());
+            let hold_start = Instant::now();
             listener.begin_caching();
+            LISTENER_LOCK_HOLD_LATENCY
+                .with_label_values(&["snapshot_begin_caching"])
+                .observe(hold_start.elapsed().as_secs_f64());
         }
 
         // Now generate snapshot - any events during this time are cached
+        let fetch_start = Instant::now();
         let visor_path = get_visor_path(&snapshot_config);
         let res = match process_rmp_file(&snapshot_config).await {
             Ok(output_fln) => {
+                SNAPSHOT_STAGE_LATENCY.with_label_values(&["compute"]).observe(fetch_start.elapsed().as_secs_f64());
+                let load_start = Instant::now();
                 let snapshot =
                     load_snapshots_from_cli_json::<InnerL4Order, (Address, L4Order)>(&output_fln, &visor_path).await;
+                SNAPSHOT_STAGE_LATENCY.with_label_values(&["load"]).observe(load_start.elapsed().as_secs_f64());
                 info!("Snapshot fetched");
                 match snapshot {
                     Ok((height, expected_snapshot)) => {
@@ -83,14 +112,32 @@ fn fetch_snapshot(
                         // Reinitialize from the snapshot and replay the cached
                         // events above its height in one lock acquisition, so no
                         // event can slip between the replay and going live.
-                        listener.lock().await.init_from_snapshot(expected_snapshot, height);
+                        let wait_start = Instant::now();
+                        let mut listener = listener.lock().await;
+                        LISTENER_LOCK_WAIT_LATENCY
+                            .with_label_values(&["snapshot_init"])
+                            .observe(wait_start.elapsed().as_secs_f64());
+                        let hold_start = Instant::now();
+                        listener.init_from_snapshot(expected_snapshot, height);
+                        LISTENER_LOCK_HOLD_LATENCY
+                            .with_label_values(&["snapshot_init"])
+                            .observe(hold_start.elapsed().as_secs_f64());
+                        SNAPSHOT_FETCH_TOTAL.with_label_values(&["success"]).inc();
                         Ok(())
                     }
-                    Err(err) => Err(err),
+                    Err(err) => {
+                        SNAPSHOT_FETCH_TOTAL.with_label_values(&["load_error"]).inc();
+                        Err(err)
+                    }
                 }
             }
-            Err(err) => Err(err),
+            Err(err) => {
+                SNAPSHOT_STAGE_LATENCY.with_label_values(&["compute"]).observe(fetch_start.elapsed().as_secs_f64());
+                SNAPSHOT_FETCH_TOTAL.with_label_values(&["compute_error"]).inc();
+                Err(err)
+            }
         };
+        SNAPSHOT_STAGE_LATENCY.with_label_values(&["total"]).observe(fetch_start.elapsed().as_secs_f64());
         let _unused = tx.send(res);
         Ok::<(), Error>(())
     });
@@ -134,7 +181,7 @@ pub struct OrderBookListener {
     // Pairs fill legs into public-schema trades; holds at most the one leg
     // awaiting its counterpart across Fills batches (single-event batches in
     // --stream-with-block-info mode).
-    trade_pairer: TradePairer,
+    trade_pairer: payload_groups::TradePairer,
     // Throttle L2 broadcasts to prevent flooding clients
     last_l2_broadcast: Option<Instant>,
     // Incremental L2 snapshot cache. Each per-coin entry is Arc'd and shared with
@@ -152,6 +199,9 @@ pub struct OrderBookListener {
     // Shared registry of L2 variant shapes any live connection wants. Read at flush
     // time so we compute only subscribed variants per coin instead of all 7.
     active_l2_params: ActiveL2Params,
+    // Shared registry of non-L2 channel interest. The listener uses this to skip
+    // grouping/render preparation for channels that have zero subscribers.
+    active_subscription_interests: ActiveSubscriptionInterests,
     // The active variant set used for the last L2 build. When it changes (a new
     // shape is subscribed, or the last subscriber of a shape leaves), the cache holds
     // the wrong shapes, so we clear it to force a full rebuild against the new set -
@@ -165,6 +215,7 @@ impl OrderBookListener {
         internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
         ignore_spot: bool,
         active_l2_params: ActiveL2Params,
+        active_subscription_interests: ActiveSubscriptionInterests,
         market_filter: (bool, bool, bool),
     ) -> Self {
         Self {
@@ -182,11 +233,12 @@ impl OrderBookListener {
             max_loss_height: 0,
             last_seen_height: 0,
             internal_message_tx,
-            trade_pairer: TradePairer::default(),
+            trade_pairer: payload_groups::TradePairer::default(),
             last_l2_broadcast: None,
             l2_snapshot_cache: HashMap::new(),
             pending_dirty_l2_coins: HashSet::new(),
             active_l2_params,
+            active_subscription_interests,
             last_active_l2_params: HashSet::new(),
         }
     }
@@ -194,6 +246,12 @@ impl OrderBookListener {
     /// Clone of the shared active-variant registry, for handing to connections.
     pub fn active_l2_params(&self) -> ActiveL2Params {
         self.active_l2_params.clone()
+    }
+
+    /// Clone of the shared non-L2 channel-interest registry, for handing to
+    /// connections.
+    pub fn active_subscription_interests(&self) -> ActiveSubscriptionInterests {
+        self.active_subscription_interests.clone()
     }
 
     /// Opt out of snapshot re-fetch on data loss. The book keeps applying live
@@ -275,6 +333,7 @@ impl OrderBookListener {
 
     fn init_from_snapshot(&mut self, snapshot: Snapshots<InnerL4Order>, height: u64) {
         info!("Initializing from snapshot at height {}", height);
+        let init_start = Instant::now();
         let mut new_state = OrderBookState::from_snapshot(snapshot, height, 0, true, self.ignore_spot);
 
         // Replay every cached batch above the snapshot height. Batches at or
@@ -286,6 +345,7 @@ impl OrderBookListener {
         self.cached_event_count = 0;
         let mut replayed = 0usize;
         let mut replay_failed = false;
+        let replay_start = Instant::now();
         for batch in cache {
             let res = match batch {
                 EventBatch::Orders(b) if b.block_number() > height => {
@@ -303,6 +363,8 @@ impl OrderBookListener {
                 replay_failed = true;
             }
         }
+        SNAPSHOT_STAGE_LATENCY.with_label_values(&["replay"]).observe(replay_start.elapsed().as_secs_f64());
+        SNAPSHOT_REPLAY_EVENTS.observe(replayed as f64);
         info!("Replayed {replayed} cached events above snapshot height {height}");
         let prior_loss_height = self.max_loss_height;
         self.order_book_state = Some(new_state);
@@ -337,6 +399,7 @@ impl OrderBookListener {
         // Force the next flush to treat the active variant set as "changed" so the
         // empty cache is rebuilt against whatever shapes are currently subscribed.
         self.last_active_l2_params.clear();
+        SNAPSHOT_STAGE_LATENCY.with_label_values(&["init"]).observe(init_start.elapsed().as_secs_f64());
         info!("Order book ready at height {}", height);
     }
 
@@ -363,7 +426,7 @@ fn coin_in_market_filter(coin: &Coin, (include_perps, include_spot, include_hip3
 fn parse_event_line(line: &str, event_source: EventSource) -> Option<(u64, EventBatch)> {
     // Count events for debugging
     static HFT_EVENT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let count = HFT_EVENT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let count = HFT_EVENT_COUNT.fetch_add(1, Ordering::Relaxed);
     if count % 1000 == 0 {
         log::debug!("parse_event_line event #{}, source: {}, line_len: {}", count, event_source, line.len());
     }
@@ -371,6 +434,8 @@ fn parse_event_line(line: &str, event_source: EventSource) -> Option<(u64, Event
     if line.is_empty() {
         return None;
     }
+
+    let parse_start = Instant::now();
 
     // Parse the batch
     let res = match event_source {
@@ -384,15 +449,18 @@ fn parse_event_line(line: &str, event_source: EventSource) -> Option<(u64, Event
             .map(|batch: Batch<NodeDataOrderDiff>| (batch.block_number(), EventBatch::BookDiffs(batch))),
     };
 
+    FILE_PARSE_LATENCY.with_label_values(&[event_source.metric_label()]).observe(parse_start.elapsed().as_secs_f64());
+
     match res {
         Ok((height, event_batch)) => {
+            observe_event_batch_age(event_source, "parsed", &event_batch);
             // Record file watcher metrics
             FILE_EVENTS_TOTAL.with_label_values(&[event_source.metric_label()]).inc();
             FILE_LINES_PARSED_TOTAL.with_label_values(&[event_source.metric_label()]).inc_by(line.len() as u64);
 
             // Log successful parses periodically
             static PARSE_OK_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let ok_count = PARSE_OK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let ok_count = PARSE_OK_COUNT.fetch_add(1, Ordering::Relaxed);
             if ok_count % 10_000 == 0 {
                 log::debug!("parse OK #{}: height={}, source={}", ok_count, height, event_source);
             }
@@ -402,12 +470,33 @@ fn parse_event_line(line: &str, event_source: EventSource) -> Option<(u64, Event
             // Log ALL parse errors for debugging
             PARSE_ERRORS_TOTAL.with_label_values(&[event_source.metric_label()]).inc();
             static PARSE_ERR_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let err_count = PARSE_ERR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let err_count = PARSE_ERR_COUNT.fetch_add(1, Ordering::Relaxed);
             if err_count % 1000 == 0 {
                 error!("parse error #{}: {}, source: {}, line_len: {}", err_count, err, event_source, line.len());
             }
             None
         }
+    }
+}
+
+fn observe_event_batch_age(event_source: EventSource, stage: &'static str, event_batch: &EventBatch) {
+    let source_label = event_source.metric_label();
+    observe_source_event_age(source_label, "block_time", stage, event_batch.block_time());
+    observe_source_event_age(source_label, "local_time", stage, event_batch.local_time());
+}
+
+fn send_internal_broadcast(tx: &Sender<Arc<InternalMessage>>, msg: Arc<InternalMessage>) {
+    let channel = msg.fanout_channel().label();
+    let receiver_count = tx.receiver_count();
+    BROADCAST_RECEIVERS.set(receiver_count as i64);
+    INTERNAL_BROADCAST_RECEIVERS.with_label_values(&[channel]).observe(receiver_count as f64);
+    INTERNAL_BROADCAST_PAYLOAD_GROUPS.with_label_values(&[channel]).observe(msg.payload_group_count() as f64);
+    INTERNAL_BROADCAST_PAYLOAD_EVENTS.with_label_values(&[channel]).observe(msg.payload_event_count() as f64);
+    let send_start = Instant::now();
+    let res = tx.send(msg);
+    INTERNAL_BROADCAST_SEND_LATENCY.with_label_values(&[channel]).observe(send_start.elapsed().as_secs_f64());
+    if res.is_err() {
+        INTERNAL_BROADCAST_SEND_ERRORS_TOTAL.with_label_values(&[channel, "no_receivers"]).inc();
     }
 }
 
@@ -426,38 +515,36 @@ impl SharedFrame {
     /// The serialized frame, building it on first use. A serialization failure
     /// (our bug, not the client's) is logged once and yields an empty frame,
     /// which the send path skips.
-    pub(crate) fn get_or_serialize<T: serde::Serialize>(&self, build: impl FnOnce() -> T) -> bytes::Bytes {
-        self.0
-            .get_or_init(|| match serde_json::to_string(&build()) {
+    pub(crate) fn get_or_serialize<T: serde::Serialize>(
+        &self,
+        channel: &'static str,
+        build: impl FnOnce() -> T,
+    ) -> bytes::Bytes {
+        if let Some(hit) = self.0.get() {
+            WIRE_FRAME_CACHE_TOTAL.with_label_values(&[channel, "hit"]).inc();
+            WIRE_FRAME_BYTES.with_label_values(&[channel]).observe(hit.len() as f64);
+            return hit.clone();
+        }
+
+        let mut built_here = false;
+        let frame = self.0.get_or_init(|| {
+            built_here = true;
+            let build_start = Instant::now();
+            let bytes = match serde_json::to_string(&build()) {
                 Ok(json) => bytes::Bytes::from(json),
                 Err(err) => {
                     error!("Server response serialization error: {err}");
+                    WIRE_FRAME_BUILD_ERRORS_TOTAL.with_label_values(&[channel]).inc();
                     bytes::Bytes::new()
                 }
-            })
-            .clone()
+            };
+            WIRE_FRAME_BUILD_LATENCY.with_label_values(&[channel]).observe(build_start.elapsed().as_secs_f64());
+            WIRE_FRAME_BYTES.with_label_values(&[channel]).observe(bytes.len() as f64);
+            bytes
+        });
+        WIRE_FRAME_CACHE_TOTAL.with_label_values(&[channel, if built_here { "miss" } else { "race" }]).inc();
+        frame.clone()
     }
-}
-
-/// One coin's trades plus the shared `trades` wire frame.
-pub struct CoinTrades {
-    pub trades: Arc<Vec<Trade>>,
-    pub(crate) frame: SharedFrame,
-}
-
-/// One coin's order diffs plus the shared wire frames derived from them
-/// (`bookDiffs` for `BookDiffs` subscribers, `l4Book` updates for `L4Book` ones).
-pub struct CoinDiffs {
-    pub diffs: Arc<Vec<NodeDataOrderDiff>>,
-    pub(crate) book_diffs_frame: SharedFrame,
-    pub(crate) l4_frame: SharedFrame,
-}
-
-/// One coin's order statuses plus the shared `l4Book` updates wire frame.
-/// `OrderUpdates` subscribers filter the raw `statuses` per user instead.
-pub struct CoinStatuses {
-    pub statuses: Arc<Vec<NodeDataOrderStatus>>,
-    pub(crate) l4_frame: SharedFrame,
 }
 
 /// Raw fixed-point (px, sz, n) for the best bid and ask of one coin.
@@ -471,26 +558,111 @@ pub struct CoinBbo {
     pub(crate) frame: SharedFrame,
 }
 
-/// Cache key for one fully-rendered L2 variant: the aggregation shape plus the
-/// send-time `n_levels` truncation (two subscriptions differing only in
-/// `n_levels` produce different payloads).
-#[derive(Hash, Eq, PartialEq)]
-pub(crate) struct L2FrameKey {
-    coin: String,
+/// Borrowed cache lookup for one fully-rendered L2 variant. This keeps
+/// per-connection cache hits allocation-free; the owned coin string already
+/// lives inside the cached [`L2BuiltFrame`] payload on misses.
+#[derive(Clone, Copy)]
+struct L2FrameLookup<'a> {
+    coin: &'a str,
     n_sig_figs: Option<u32>,
     mantissa: Option<u64>,
     n_levels: usize,
 }
 
-impl L2FrameKey {
-    pub(crate) fn new(coin: &str, n_sig_figs: Option<u32>, mantissa: Option<u64>, n_levels: usize) -> Self {
-        Self { coin: coin.to_string(), n_sig_figs, mantissa, n_levels }
+impl L2FrameLookup<'_> {
+    fn hash_key(self) -> u64 {
+        let mut hasher = rustc_hash::FxHasher::default();
+        self.coin.hash(&mut hasher);
+        self.n_sig_figs.hash(&mut hasher);
+        self.mantissa.hash(&mut hasher);
+        self.n_levels.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn matches(self, frame: &L2BuiltFrame) -> bool {
+        frame.coin() == self.coin
+            && frame.n_sig_figs() == self.n_sig_figs
+            && frame.mantissa() == self.mantissa
+            && frame.n_levels() == Some(self.n_levels)
     }
 }
 
-/// One rendered L2 variant: (dedup hash over the exported levels, wire frame,
-/// payload struct for heartbeat-enabled connections).
-pub(crate) type L2BuiltFrame = (u64, bytes::Bytes, L2Book);
+/// One rendered L2 variant, shared by every transport connection that needs the
+/// same `(coin, aggregation shape, nLevels)` payload during one broadcast. The
+/// expensive truncate/export/hash work happens once; WebSocket JSON bytes are
+/// serialized lazily only when a WebSocket connection needs them.
+pub struct L2BuiltFrame {
+    hash: u64,
+    payload: L2Book,
+    websocket_frame: std::sync::OnceLock<bytes::Bytes>,
+}
+
+impl L2BuiltFrame {
+    fn new(hash: u64, payload: L2Book) -> Self {
+        Self { hash, payload, websocket_frame: std::sync::OnceLock::new() }
+    }
+
+    pub const fn hash(&self) -> u64 {
+        self.hash
+    }
+
+    pub fn coin(&self) -> &str {
+        self.payload.coin()
+    }
+
+    pub const fn time(&self) -> u64 {
+        self.payload.time()
+    }
+
+    pub const fn n_sig_figs(&self) -> Option<u32> {
+        self.payload.n_sig_figs()
+    }
+
+    pub const fn mantissa(&self) -> Option<u64> {
+        self.payload.mantissa()
+    }
+
+    pub const fn n_levels(&self) -> Option<usize> {
+        self.payload.n_levels()
+    }
+
+    pub const fn levels(&self) -> &[Vec<crate::types::Level>; 2] {
+        self.payload.levels()
+    }
+
+    pub(crate) fn payload_clone(&self) -> L2Book {
+        self.payload.clone()
+    }
+
+    pub(crate) fn websocket_frame(&self) -> bytes::Bytes {
+        if let Some(hit) = self.websocket_frame.get() {
+            WIRE_FRAME_CACHE_TOTAL.with_label_values(&["l2Book", "frame_hit"]).inc();
+            WIRE_FRAME_BYTES.with_label_values(&["l2Book"]).observe(hit.len() as f64);
+            return hit.clone();
+        }
+
+        let mut built_here = false;
+        let frame = self.websocket_frame.get_or_init(|| {
+            built_here = true;
+            let build_start = Instant::now();
+            let bytes = match serde_json::to_string(&ServerResponse::L2Book(self.payload.clone())) {
+                Ok(json) => bytes::Bytes::from(json),
+                Err(err) => {
+                    error!("Server response serialization error: {err}");
+                    WIRE_FRAME_BUILD_ERRORS_TOTAL.with_label_values(&["l2Book"]).inc();
+                    bytes::Bytes::new()
+                }
+            };
+            WIRE_FRAME_BUILD_LATENCY.with_label_values(&["l2Book"]).observe(build_start.elapsed().as_secs_f64());
+            WIRE_FRAME_BYTES.with_label_values(&["l2Book"]).observe(bytes.len() as f64);
+            bytes
+        });
+        WIRE_FRAME_CACHE_TOTAL
+            .with_label_values(&["l2Book", if built_here { "frame_miss" } else { "frame_race" }])
+            .inc();
+        frame.clone()
+    }
+}
 
 /// Per-broadcast lazy cache of rendered L2 variants, shared by every connection
 /// through the message `Arc`. The first connection needing a given
@@ -498,121 +670,81 @@ pub(crate) type L2BuiltFrame = (u64, bytes::Bytes, L2Book);
 /// every other connection reuses the dedup hash, the wire frame (refcounted
 /// bytes), and - for heartbeat-enabled connections - the payload struct.
 /// The old path repeated all of that work per subscribed connection.
-pub struct L2FrameCache(std::sync::Mutex<rustc_hash::FxHashMap<L2FrameKey, Arc<L2BuiltFrame>>>);
+pub struct L2FrameCache(std::sync::Mutex<rustc_hash::FxHashMap<u64, Vec<Arc<L2BuiltFrame>>>>);
 
 impl L2FrameCache {
     fn new() -> Self {
         Self(std::sync::Mutex::new(rustc_hash::FxHashMap::default()))
     }
 
-    /// Cached (dedup hash, frame, payload) for `key`, building on first use.
+    /// Cached rendered L2 payload for `key`, building on first use.
     /// `build` runs OUTSIDE the lock so a slow render never blocks other
     /// connections; on a lost insert race the first entry wins (both builds
     /// produce identical bytes).
-    pub(crate) fn get_or_build(&self, key: L2FrameKey, build: impl FnOnce() -> L2BuiltFrame) -> Arc<L2BuiltFrame> {
+    pub fn get_or_build(
+        &self,
+        coin: &str,
+        n_sig_figs: Option<u32>,
+        mantissa: Option<u64>,
+        n_levels: usize,
+        time: u64,
+        variant: Option<&Snapshot<InnerLevel>>,
+    ) -> Arc<L2BuiltFrame> {
+        let lookup = L2FrameLookup { coin, n_sig_figs, mantissa, n_levels };
+        let key_hash = lookup.hash_key();
         if let Ok(map) = self.0.lock()
-            && let Some(hit) = map.get(&key)
+            && let Some(bucket) = map.get(&key_hash)
+            && let Some(hit) = bucket.iter().find(|frame| lookup.matches(frame))
         {
+            WIRE_FRAME_CACHE_TOTAL.with_label_values(&["l2Book", "hit"]).inc();
             return Arc::clone(hit);
         }
-        let fresh = Arc::new(build());
+        let build_start = Instant::now();
+        let fresh = Arc::new(build_l2_frame(coin, n_sig_figs, mantissa, n_levels, time, variant));
+        LISTENER_STAGE_LATENCY
+            .with_label_values(&["l2Book", "render_payload"])
+            .observe(build_start.elapsed().as_secs_f64());
         match self.0.lock() {
-            Ok(mut map) => Arc::clone(map.entry(key).or_insert(fresh)),
+            Ok(mut map) => {
+                let bucket = map.entry(key_hash).or_default();
+                if let Some(hit) = bucket.iter().find(|frame| lookup.matches(frame)) {
+                    WIRE_FRAME_CACHE_TOTAL.with_label_values(&["l2Book", "race"]).inc();
+                    Arc::clone(hit)
+                } else {
+                    WIRE_FRAME_CACHE_TOTAL.with_label_values(&["l2Book", "miss"]).inc();
+                    bucket.push(Arc::clone(&fresh));
+                    fresh
+                }
+            }
             // Poisoned lock (a panicked builder elsewhere): serve the local build.
-            Err(_) => fresh,
-        }
-    }
-}
-
-/// Group a fills batch into per-coin trade vectors. Consumes the batch (fills
-/// are never applied to the book), so this is move-only - no event is cloned.
-/// Pairs the two fill legs of each trade match into one public-schema print,
-/// grouped per coin for broadcast.
-///
-/// A match produces two fill records (buyer + seller) sharing a `tid`. The
-/// node emits them as immediate neighbours in the fills stream — adjacent
-/// within a block, and in `--stream-with-block-info` mode as two consecutive
-/// single-event `Fills` batches. So pairing only needs to remember the single
-/// previous leg: when the next leg shares its `tid` they form a trade;
-/// otherwise the previous leg was unpairable and is dropped. This is O(1) per
-/// fill, allocates nothing beyond the output, and cannot leak — at most one
-/// leg is ever held.
-///
-/// Dropped legs are counted in `TRADES_UNPAIRED_FILLS_TOTAL` — ~0 in steady
-/// state; growth means the node stopped emitting the two legs of a match
-/// adjacently and pairing should be revisited.
-#[derive(Default)]
-struct TradePairer {
-    prev: Option<NodeDataFill>,
-}
-
-impl TradePairer {
-    fn group(&mut self, batch: Batch<NodeDataFill>) -> HashMap<String, CoinTrades> {
-        let mut by_coin: HashMap<String, Vec<Trade>> = HashMap::new();
-        for fill in batch.events() {
-            match self.prev.take() {
-                Some(prev) if prev.1.tid == fill.1.tid => {
-                    let (bid, ask) = if fill.1.side == Side::Bid { (fill, prev) } else { (prev, fill) };
-                    if let Some(trade) = Trade::from_fills(bid, ask) {
-                        by_coin.entry(trade.coin.clone()).or_default().push(trade);
-                    } else {
-                        // Same tid but mismatched coin/sides: both legs are
-                        // unpairable, count them so this stays observable.
-                        TRADES_UNPAIRED_FILLS_TOTAL.inc_by(2);
-                    }
-                }
-                Some(_) => {
-                    // Previous leg never met its counterpart: unpairable, drop it.
-                    TRADES_UNPAIRED_FILLS_TOTAL.inc();
-                    self.prev = Some(fill);
-                }
-                None => self.prev = Some(fill),
+            Err(_) => {
+                WIRE_FRAME_CACHE_TOTAL.with_label_values(&["l2Book", "poisoned"]).inc();
+                fresh
             }
         }
-        by_coin
-            .into_iter()
-            .map(|(coin, trades)| (coin, CoinTrades { trades: Arc::new(trades), frame: SharedFrame::new() }))
-            .collect()
     }
 }
 
-/// Group order diffs per coin (one clone per event - the batch itself is
-/// consumed by the state apply). `skip_spot` folds the `--markets` filtering
-/// in, replacing the old whole-batch `filter_events` clone.
-fn group_diffs_by_coin(events: &[NodeDataOrderDiff], skip_spot: bool) -> HashMap<String, CoinDiffs> {
-    let mut by_coin: HashMap<String, Vec<NodeDataOrderDiff>> = HashMap::new();
-    for diff in events {
-        let coin = diff.coin();
-        if skip_spot && coin.is_spot() {
-            continue;
-        }
-        by_coin.entry(coin.value()).or_default().push(diff.clone());
-    }
-    by_coin
-        .into_iter()
-        .map(|(coin, diffs)| {
-            (
-                coin,
-                CoinDiffs {
-                    diffs: Arc::new(diffs),
-                    book_diffs_frame: SharedFrame::new(),
-                    l4_frame: SharedFrame::new(),
-                },
-            )
-        })
-        .collect()
-}
+fn build_l2_frame(
+    coin: &str,
+    n_sig_figs: Option<u32>,
+    mantissa: Option<u64>,
+    n_levels: usize,
+    time: u64,
+    variant: Option<&Snapshot<InnerLevel>>,
+) -> L2BuiltFrame {
+    let exported: [Vec<crate::types::Level>; 2] =
+        variant.map_or_else(|| [Vec::new(), Vec::new()], |v| v.truncate(n_levels).export_inner_snapshot());
 
-/// Group order statuses per coin (one clone per event).
-fn group_statuses_by_coin(events: &[NodeDataOrderStatus]) -> HashMap<String, CoinStatuses> {
-    let mut by_coin: HashMap<String, Vec<NodeDataOrderStatus>> = HashMap::new();
-    for status in events {
-        by_coin.entry(status.order.coin.clone()).or_default().push(status.clone());
-    }
-    by_coin
-        .into_iter()
-        .map(|(coin, statuses)| (coin, CoinStatuses { statuses: Arc::new(statuses), l4_frame: SharedFrame::new() }))
-        .collect()
+    // Hash the exported levels for dedup comparison. Level derives Hash;
+    // FxHasher because this hashes our own payload (no DoS surface).
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    exported.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    let payload = L2Book::from_l2_snapshot(coin.to_string(), exported, time, n_sig_figs, mantissa, Some(n_levels));
+    L2BuiltFrame::new(hash, payload)
 }
 
 impl OrderBookListener {
@@ -641,6 +773,7 @@ impl OrderBookListener {
         self.cached_event_count += events_len;
         if let Some(cache) = self.fetched_snapshot_cache.as_mut() {
             cache.push_back(event_batch);
+            SNAPSHOT_REPLAY_CACHE_EVENTS.observe(self.cached_event_count as f64);
         }
     }
 
@@ -715,8 +848,12 @@ impl OrderBookListener {
             self.mark_desynced("oversize_batch");
             return;
         }
+        EVENT_BATCH_SIZE.with_label_values(&[source_label]).observe(events_len as f64);
 
         let process_start = Instant::now();
+        let event_block_time = event_batch.block_time();
+        let event_local_time = event_batch.local_time();
+        observe_event_batch_age(event_source, "apply_start", &event_batch);
 
         if height % 100 == 0 {
             log::debug!("{event_source} block: {height}");
@@ -725,6 +862,8 @@ impl OrderBookListener {
         // Cache for replay while a snapshot fetch is in flight; bail out when the
         // batch was consumed by the cache (book not ready to apply it yet).
         let Some(event_batch) = self.cache_for_replay(event_batch) else {
+            observe_source_event_age(source_label, "block_time", "cached_for_replay", event_block_time);
+            observe_source_event_age(source_label, "local_time", "cached_for_replay", event_local_time);
             return;
         };
 
@@ -734,24 +873,51 @@ impl OrderBookListener {
         let changed_coins: HashSet<Coin> = if let Some(state) = self.order_book_state.as_mut() {
             let result = match event_batch {
                 EventBatch::Orders(batch) => {
+                    let broadcast_prep_start = Instant::now();
                     // Broadcast L4 order statuses for L4Book / orderUpdates
                     // subscribers: grouped per coin ONCE here (one clone per
                     // event), shared via Arc by every connection - the old path
                     // cloned the whole batch per subscribed connection.
                     if let Some(tx) = &self.internal_message_tx {
-                        if tx.receiver_count() > 0 && batch.events_len() > 0 {
+                        let receiver_count = tx.receiver_count();
+                        let wants_l4 = self.active_subscription_interests.has(SubscriptionInterest::L4Book);
+                        let wants_order_updates =
+                            self.active_subscription_interests.has(SubscriptionInterest::OrderUpdates);
+                        if receiver_count > 0 && batch.events_len() > 0 && (wants_l4 || wants_order_updates) {
                             let msg = Arc::new(InternalMessage::L4OrderStatuses {
                                 time: batch.block_time(),
                                 height: batch.block_number(),
-                                statuses_by_coin: group_statuses_by_coin(batch.events_ref()),
+                                statuses_by_coin: if wants_l4 {
+                                    CoinStatuses::group_by_coin(batch.events_ref())
+                                } else {
+                                    HashMap::new()
+                                },
+                                statuses_by_user: if wants_order_updates {
+                                    UserStatuses::group_by_user(batch.events_ref())
+                                } else {
+                                    HashMap::new()
+                                },
                             });
-                            drop(tx.send(msg));
+                            send_internal_broadcast(tx, msg);
+                        } else if receiver_count > 0 && batch.events_len() > 0 {
+                            BROADCAST_PREP_SKIPPED_TOTAL
+                                .with_label_values(&["orderStatuses", "no_active_subscription"])
+                                .inc();
                         }
                     }
-                    EVENTS_PROCESSED_TOTAL.with_label_values(&["orders"]).inc();
-                    state.apply_order_statuses_hft(batch)
+                    LISTENER_STAGE_LATENCY
+                        .with_label_values(&[source_label, "broadcast_prep"])
+                        .observe(broadcast_prep_start.elapsed().as_secs_f64());
+                    EVENTS_PROCESSED_TOTAL.with_label_values(&["orders"]).inc_by(batch.events_len() as u64);
+                    let apply_start = Instant::now();
+                    let result = state.apply_order_statuses_hft(batch);
+                    LISTENER_STAGE_LATENCY
+                        .with_label_values(&[source_label, "state_apply"])
+                        .observe(apply_start.elapsed().as_secs_f64());
+                    result
                 }
                 EventBatch::BookDiffs(batch) => {
+                    let broadcast_prep_start = Instant::now();
                     // Broadcast L4 order diffs for L4Book / BookDiffs subscribers,
                     // grouped per coin once and Arc-shared across connections.
                     // Defense-in-depth: when running with `ignore_spot=true`, the
@@ -759,33 +925,58 @@ impl OrderBookListener {
                     // clients would see events for coins whose state we never
                     // applied locally.
                     if let Some(tx) = &self.internal_message_tx {
-                        if tx.receiver_count() > 0 {
-                            let diffs_by_coin = group_diffs_by_coin(batch.events_ref(), state.ignore_spot());
+                        let receiver_count = tx.receiver_count();
+                        let wants_l4 = self.active_subscription_interests.has(SubscriptionInterest::L4Book);
+                        let wants_book_diffs = self.active_subscription_interests.has(SubscriptionInterest::BookDiffs);
+                        if receiver_count > 0 && (wants_l4 || wants_book_diffs) {
+                            let diffs_by_coin = CoinDiffs::group_by_coin(batch.events_ref(), state.ignore_spot());
                             if !diffs_by_coin.is_empty() {
                                 let msg = Arc::new(InternalMessage::L4OrderDiffs {
                                     time: batch.block_time(),
                                     height: batch.block_number(),
                                     diffs_by_coin,
                                 });
-                                drop(tx.send(msg));
+                                send_internal_broadcast(tx, msg);
                             }
+                        } else if receiver_count > 0 && batch.events_len() > 0 {
+                            BROADCAST_PREP_SKIPPED_TOTAL
+                                .with_label_values(&["orderDiffs", "no_active_subscription"])
+                                .inc();
                         }
                     }
-                    EVENTS_PROCESSED_TOTAL.with_label_values(&["diffs"]).inc();
-                    state.apply_order_diffs_hft(batch)
+                    LISTENER_STAGE_LATENCY
+                        .with_label_values(&[source_label, "broadcast_prep"])
+                        .observe(broadcast_prep_start.elapsed().as_secs_f64());
+                    EVENTS_PROCESSED_TOTAL.with_label_values(&["diffs"]).inc_by(batch.events_len() as u64);
+                    let apply_start = Instant::now();
+                    let result = state.apply_order_diffs_hft(batch);
+                    LISTENER_STAGE_LATENCY
+                        .with_label_values(&[source_label, "state_apply"])
+                        .observe(apply_start.elapsed().as_secs_f64());
+                    result
                 }
                 EventBatch::Fills(batch) => {
-                    EVENTS_PROCESSED_TOTAL.with_label_values(&["fills"]).inc();
+                    let broadcast_prep_start = Instant::now();
+                    EVENTS_PROCESSED_TOTAL.with_label_values(&["fills"]).inc_by(batch.events_len() as u64);
                     // Broadcast fills grouped per coin (move-only - the batch is
                     // never applied to the book, so no event is cloned).
-                    if self.internal_message_tx.as_ref().is_some_and(|tx| tx.receiver_count() > 0) {
-                        let trades_by_coin = self.trade_pairer.group(batch);
+                    if self.internal_message_tx.as_ref().is_some_and(|tx| tx.receiver_count() > 0)
+                        && self.active_subscription_interests.has(SubscriptionInterest::Trades)
+                    {
+                        let trades_by_coin = self.trade_pairer.group_by_coin(batch);
                         if !trades_by_coin.is_empty() {
                             if let Some(tx) = &self.internal_message_tx {
-                                drop(tx.send(Arc::new(InternalMessage::Fills { trades_by_coin })));
+                                send_internal_broadcast(tx, Arc::new(InternalMessage::Fills { trades_by_coin }));
                             }
                         }
+                    } else if self.internal_message_tx.as_ref().is_some_and(|tx| tx.receiver_count() > 0)
+                        && batch.events_len() > 0
+                    {
+                        BROADCAST_PREP_SKIPPED_TOTAL.with_label_values(&["trades", "no_active_subscription"]).inc();
                     }
+                    LISTENER_STAGE_LATENCY
+                        .with_label_values(&[source_label, "broadcast_prep"])
+                        .observe(broadcast_prep_start.elapsed().as_secs_f64());
                     Ok(HashSet::new())
                 }
             };
@@ -811,11 +1002,12 @@ impl OrderBookListener {
         } else {
             HashSet::new()
         };
+        STATE_APPLY_CHANGED_COINS.with_label_values(&[source_label]).observe(changed_coins.len() as f64);
         EVENT_PROCESSING_LATENCY.with_label_values(&[source_label]).observe(process_start.elapsed().as_secs_f64());
 
         // Log HFT state progress periodically
         static HFT_STATE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let sc = HFT_STATE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sc = HFT_STATE_COUNT.fetch_add(1, Ordering::Relaxed);
         if sc % 1000 == 0 {
             if let Some(state) = &mut self.order_book_state {
                 // Record health metrics
@@ -854,11 +1046,11 @@ impl OrderBookListener {
         if !changed_coins.is_empty() {
             if let Some(state) = &self.order_book_state {
                 if let Some(tx) = &self.internal_message_tx {
-                    if tx.receiver_count() > 0 {
+                    if tx.receiver_count() > 0 && self.active_subscription_interests.has(SubscriptionInterest::Bbo) {
                         let bbo_start = Instant::now();
                         let (time, bbos) = state.get_bbos_for_coins(&changed_coins);
                         static BBO_BROADCAST_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                        let bc = BBO_BROADCAST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let bc = BBO_BROADCAST_COUNT.fetch_add(1, Ordering::Relaxed);
                         if bc % 1000 == 0 {
                             log::debug!(
                                 "Fast BBO broadcast #{} at time {} for {} coins",
@@ -874,8 +1066,12 @@ impl OrderBookListener {
                             .map(|(coin, raw)| (coin, CoinBbo { raw, frame: SharedFrame::new() }))
                             .collect();
                         let msg = Arc::new(InternalMessage::BboUpdate { bbos, time });
-                        drop(tx.send(msg));
-                        BBO_BROADCAST_LATENCY.observe(bbo_start.elapsed().as_secs_f64());
+                        send_internal_broadcast(tx, msg);
+                        let elapsed = bbo_start.elapsed().as_secs_f64();
+                        BBO_BROADCAST_LATENCY.observe(elapsed);
+                        LISTENER_STAGE_LATENCY.with_label_values(&[source_label, "bbo_prep"]).observe(elapsed);
+                    } else if tx.receiver_count() > 0 {
+                        BROADCAST_PREP_SKIPPED_TOTAL.with_label_values(&["bbo", "no_active_subscription"]).inc();
                     }
                 }
             }
@@ -906,6 +1102,8 @@ impl OrderBookListener {
         // be served their stale snapshots. With no subscribers the buffer keeps
         // accumulating (deduped by coin, bounded by the universe size).
         self.pending_dirty_l2_coins.extend(changed_coins.iter().cloned());
+        observe_source_event_age(source_label, "block_time", "listener_done", event_block_time);
+        observe_source_event_age(source_label, "local_time", "listener_done", event_local_time);
         // The L2 broadcast is NOT done inline here. The main event loop calls
         // flush_l2_if_due() right after this (and a flush ticker backstops quiet
         // periods), so the broadcast fires the moment the throttle window expires
@@ -938,10 +1136,15 @@ impl OrderBookListener {
 
         // Compute only the variant shapes some connection currently wants. With no
         // L2 subscribers there is nothing to build or send.
+        let active_start = Instant::now();
         let active = self.active_l2_params.snapshot();
+        L2_FLUSH_STAGE_LATENCY
+            .with_label_values(&["active_variant_snapshot"])
+            .observe(active_start.elapsed().as_secs_f64());
         if active.is_empty() {
             return;
         }
+        L2_ACTIVE_VARIANTS.observe(active.len() as f64);
         // When the requested shape set changes, the cache holds the wrong shapes;
         // clear it so every present coin is rebuilt with the new set on this flush
         // (bounds a new subscriber's wait to one throttle window even on quiet coins).
@@ -958,11 +1161,17 @@ impl OrderBookListener {
             let dirty = std::mem::take(&mut self.pending_dirty_l2_coins);
             L2_CONFLATION_BATCH_SIZE.observe(dirty.len() as f64);
             let l2_start = Instant::now();
+            let compute_start = Instant::now();
             let (time, l2_snapshots, recomputed, coin_set_changed) =
                 state.l2_snapshots_incremental(&dirty, &active, &mut self.l2_snapshot_cache);
+            L2_FLUSH_STAGE_LATENCY
+                .with_label_values(&["snapshot_compute"])
+                .observe(compute_start.elapsed().as_secs_f64());
+            L2_RECOMPUTED_COINS.observe(recomputed.len() as f64);
+            L2_CACHE_COINS.set(self.l2_snapshot_cache.len() as i64);
 
             static L2_BROADCAST_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let bc = L2_BROADCAST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let bc = L2_BROADCAST_COUNT.fetch_add(1, Ordering::Relaxed);
             if bc % 100 == 0 {
                 log::debug!("L2 broadcast #{} at time {} for {} dirty coins", bc, time, dirty.len());
             }
@@ -971,6 +1180,7 @@ impl OrderBookListener {
             // Built once here instead of once per connection per broadcast (the
             // old per-connection derivation allocated the full coin-name set for
             // every connection on every flush).
+            let universe_start = Instant::now();
             let universe = if coin_set_changed {
                 let market_filter = self.market_filter;
                 Some(Arc::new(
@@ -983,8 +1193,12 @@ impl OrderBookListener {
             } else {
                 None
             };
+            L2_FLUSH_STAGE_LATENCY
+                .with_label_values(&["universe_build"])
+                .observe(universe_start.elapsed().as_secs_f64());
 
             if let Some(tx) = &self.internal_message_tx {
+                let send_start = Instant::now();
                 let msg = Arc::new(InternalMessage::Snapshot {
                     l2_snapshots,
                     time,
@@ -992,7 +1206,10 @@ impl OrderBookListener {
                     universe,
                     l2_frames: L2FrameCache::new(),
                 });
-                drop(tx.send(msg));
+                send_internal_broadcast(tx, msg);
+                L2_FLUSH_STAGE_LATENCY
+                    .with_label_values(&["broadcast_send"])
+                    .observe(send_start.elapsed().as_secs_f64());
             }
             L2_BROADCAST_LATENCY.observe(l2_start.elapsed().as_secs_f64());
         }
@@ -1036,9 +1253,53 @@ pub enum InternalMessage {
     /// HFT L4 streaming - order diffs without waiting for status pairing,
     /// grouped per coin once (shared by l4Book and bookDiffs subscribers).
     L4OrderDiffs { time: u64, height: u64, diffs_by_coin: HashMap<String, CoinDiffs> },
-    /// HFT L4 streaming - order statuses without waiting for diff pairing,
-    /// grouped per coin once (shared by l4Book and orderUpdates subscribers).
-    L4OrderStatuses { time: u64, height: u64, statuses_by_coin: HashMap<String, CoinStatuses> },
+    /// HFT L4 streaming - order statuses without waiting for diff pairing.
+    /// `l4Book` uses the per-coin grouping; `orderUpdates` uses the per-user
+    /// grouping to avoid scanning the whole batch per subscribed user.
+    L4OrderStatuses {
+        time: u64,
+        height: u64,
+        statuses_by_coin: HashMap<String, CoinStatuses>,
+        statuses_by_user: HashMap<Address, UserStatuses>,
+    },
+}
+
+impl InternalMessage {
+    pub const fn fanout_channel(&self) -> FanoutChannel {
+        match self {
+            Self::Snapshot { .. } => FanoutChannel::L2Book,
+            Self::Fills { .. } => FanoutChannel::Trades,
+            Self::BboUpdate { .. } => FanoutChannel::Bbo,
+            Self::L4OrderDiffs { .. } => FanoutChannel::BookDiffs,
+            Self::L4OrderStatuses { .. } => FanoutChannel::OrderStatuses,
+        }
+    }
+
+    pub fn payload_group_count(&self) -> usize {
+        match self {
+            Self::Snapshot { dirty, .. } => dirty.len(),
+            Self::Fills { trades_by_coin } => trades_by_coin.len(),
+            Self::BboUpdate { bbos, .. } => bbos.len(),
+            Self::L4OrderDiffs { diffs_by_coin, .. } => diffs_by_coin.len(),
+            Self::L4OrderStatuses { statuses_by_coin, statuses_by_user, .. } => {
+                statuses_by_coin.len().saturating_add(statuses_by_user.len())
+            }
+        }
+    }
+
+    pub fn payload_event_count(&self) -> usize {
+        match self {
+            Self::Snapshot { dirty, .. } => dirty.len(),
+            Self::Fills { trades_by_coin } => trades_by_coin.values().map(|trades| trades.trades.len()).sum(),
+            Self::BboUpdate { bbos, .. } => bbos.len(),
+            Self::L4OrderDiffs { diffs_by_coin, .. } => diffs_by_coin.values().map(|diffs| diffs.diffs.len()).sum(),
+            Self::L4OrderStatuses { statuses_by_coin, statuses_by_user, .. } => statuses_by_coin
+                .values()
+                .map(|statuses| statuses.statuses.len())
+                .sum::<usize>()
+                .saturating_add(statuses_by_user.values().map(|statuses| statuses.statuses.len()).sum()),
+        }
+    }
 }
 
 #[derive(Eq, PartialEq, Hash, Clone, Copy)]
@@ -1103,6 +1364,71 @@ impl Drop for L2ParamGuard {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum SubscriptionInterest {
+    Bbo,
+    Trades,
+    L4Book,
+    BookDiffs,
+    OrderUpdates,
+}
+
+impl SubscriptionInterest {
+    const COUNT: usize = 5;
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Bbo => 0,
+            Self::Trades => 1,
+            Self::L4Book => 2,
+            Self::BookDiffs => 3,
+            Self::OrderUpdates => 4,
+        }
+    }
+}
+
+/// Refcounted set of non-L2 channels that have at least one live subscription.
+/// The listener reads this before doing per-channel broadcast preparation, so a
+/// lone L2 client does not pay BBO/L4/trades grouping costs.
+#[derive(Clone)]
+pub struct ActiveSubscriptionInterests {
+    inner: Arc<[AtomicUsize; SubscriptionInterest::COUNT]>,
+}
+
+impl Default for ActiveSubscriptionInterests {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ActiveSubscriptionInterests {
+    pub fn new() -> Self {
+        Self { inner: Arc::new(std::array::from_fn(|_| AtomicUsize::new(0))) }
+    }
+
+    #[must_use]
+    pub fn acquire(&self, interest: SubscriptionInterest) -> SubscriptionInterestGuard {
+        self.inner[interest.index()].fetch_add(1, Ordering::Relaxed);
+        SubscriptionInterestGuard { registry: self.inner.clone(), interest }
+    }
+
+    pub fn has(&self, interest: SubscriptionInterest) -> bool {
+        self.inner[interest.index()].load(Ordering::Relaxed) > 0
+    }
+}
+
+/// RAII guard returned by [`ActiveSubscriptionInterests::acquire`].
+pub struct SubscriptionInterestGuard {
+    registry: Arc<[AtomicUsize; SubscriptionInterest::COUNT]>,
+    interest: SubscriptionInterest,
+}
+
+impl Drop for SubscriptionInterestGuard {
+    fn drop(&mut self) {
+        self.registry[self.interest.index()].fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 // ============================================================================
 // HFT-OPTIMIZED VERSION
 // Uses parallel file watchers and immediate OrderDiff processing
@@ -1137,8 +1463,13 @@ pub async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, config: crat
     };
 
     let ignore_spot = {
+        let wait_start = Instant::now();
         let listener = listener.lock().await;
-        listener.ignore_spot
+        LISTENER_LOCK_WAIT_LATENCY.with_label_values(&["startup_config"]).observe(wait_start.elapsed().as_secs_f64());
+        let hold_start = Instant::now();
+        let ignore_spot = listener.ignore_spot;
+        LISTENER_LOCK_HOLD_LATENCY.with_label_values(&["startup_config"]).observe(hold_start.elapsed().as_secs_f64());
+        ignore_spot
     };
 
     // Startup-backfill floor: the node's currently persisted height. The initial
@@ -1164,6 +1495,7 @@ pub async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, config: crat
     let start = Instant::now() + Duration::from_secs(5);
     let mut ticker = tokio::time::interval_at(start, Duration::from_secs(10));
     let mut snapshot_fetch_pending = false;
+    SNAPSHOT_FETCH_PENDING.set(0);
 
     // Drives L2 broadcasts on a fixed cadence so the feed has a guaranteed maximum
     // interval even when no events arrive. Skip missed ticks so a busy loop resumes
@@ -1201,7 +1533,16 @@ pub async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, config: crat
             // and the tick is only Ready every L2_FLUSH_TICK_MS, so it cannot starve
             // the event arm in return.
             _ = l2_flush_ticker.tick() => {
-                listener.lock().await.flush_l2_if_due();
+                let wait_start = Instant::now();
+                let mut guard = listener.lock().await;
+                LISTENER_LOCK_WAIT_LATENCY
+                    .with_label_values(&["l2_flush_tick"])
+                    .observe(wait_start.elapsed().as_secs_f64());
+                let hold_start = Instant::now();
+                guard.flush_l2_if_due();
+                LISTENER_LOCK_HOLD_LATENCY
+                    .with_label_values(&["l2_flush_tick"])
+                    .observe(hold_start.elapsed().as_secs_f64());
             }
 
             // Process events from the file watchers, draining up to
@@ -1216,17 +1557,19 @@ pub async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, config: crat
                 // parsing is the most expensive step of the event path), then
                 // apply everything + flush under a single lock acquisition.
                 // Arrival order is preserved across the batch.
+                FILE_WATCHER_RECV_BATCH_SIZE.observe(count as f64);
                 let mut actions = Vec::with_capacity(count);
                 for event in event_buf.drain(..) {
-                    let (line, source, is_backfill) = match event {
+                    event.observe_handoff_age();
+                    let (line, source, is_backfill) = match event.into_kind() {
                         // OrderDiffs are the BBO-critical path; statuses and fills
                         // are less latency-sensitive but share the same flow.
-                        parallel::FileEvent::OrderDiff(line) => (line, EventSource::OrderDiffs, false),
-                        parallel::FileEvent::OrderStatus(line) => (line, EventSource::OrderStatuses, false),
-                        parallel::FileEvent::Fill(line) => (line, EventSource::Fills, false),
-                        parallel::FileEvent::BackfillOrderDiff(line) => (line, EventSource::OrderDiffs, true),
-                        parallel::FileEvent::BackfillOrderStatus(line) => (line, EventSource::OrderStatuses, true),
-                        parallel::FileEvent::Desync(source) => {
+                        parallel::FileEventKind::OrderDiff(line) => (line, EventSource::OrderDiffs, false),
+                        parallel::FileEventKind::OrderStatus(line) => (line, EventSource::OrderStatuses, false),
+                        parallel::FileEventKind::Fill(line) => (line, EventSource::Fills, false),
+                        parallel::FileEventKind::BackfillOrderDiff(line) => (line, EventSource::OrderDiffs, true),
+                        parallel::FileEventKind::BackfillOrderStatus(line) => (line, EventSource::OrderStatuses, true),
+                        parallel::FileEventKind::Desync(source) => {
                             // The watcher discarded data (oversized partial line);
                             // the book can no longer be trusted - trigger a re-sync.
                             error!("{source} watcher reported data loss");
@@ -1245,7 +1588,12 @@ pub async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, config: crat
                     }
                 }
                 if !actions.is_empty() {
+                    let wait_start = Instant::now();
                     let mut guard = listener.lock().await;
+                    LISTENER_LOCK_WAIT_LATENCY
+                        .with_label_values(&["event_batch"])
+                        .observe(wait_start.elapsed().as_secs_f64());
+                    let hold_start = Instant::now();
                     for action in actions {
                         match action {
                             Action::Apply(height, batch, source) => guard.apply_event_batch(height, batch, source),
@@ -1257,18 +1605,32 @@ pub async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, config: crat
                     // window expires (O(1) when not due) instead of waiting for
                     // the next flush tick.
                     guard.flush_l2_if_due();
+                    LISTENER_LOCK_HOLD_LATENCY
+                        .with_label_values(&["event_batch"])
+                        .observe(hold_start.elapsed().as_secs_f64());
                 }
             }
 
             // Snapshot fetch result
             snapshot_fetch_res = snapshot_fetch_task_rx.recv() => {
                 snapshot_fetch_pending = false;
+                SNAPSHOT_FETCH_PENDING.set(0);
                 match snapshot_fetch_res {
                     None => {
                         return Err("Snapshot fetch task sender dropped".into());
                     }
                     Some(Err(err)) => {
-                        if listener.lock().await.is_ready() {
+                        let wait_start = Instant::now();
+                        let guard = listener.lock().await;
+                        LISTENER_LOCK_WAIT_LATENCY
+                            .with_label_values(&["snapshot_result_ready_check"])
+                            .observe(wait_start.elapsed().as_secs_f64());
+                        let hold_start = Instant::now();
+                        let is_ready = guard.is_ready();
+                        LISTENER_LOCK_HOLD_LATENCY
+                            .with_label_values(&["snapshot_result_ready_check"])
+                            .observe(hold_start.elapsed().as_secs_f64());
+                        if is_ready {
                             // A re-sync fetch failed (e.g. transient docker /
                             // hl-node hiccup). Keep serving the current book;
                             // needs_resync is still set so the ticker retries.
@@ -1296,7 +1658,7 @@ pub async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, config: crat
                 // restarting us would not fix the node, so don't exit for it.
                 let now_ms = parallel::now_unix_ms();
                 for (name, last) in [("OrderDiffs", &last_order_diffs), ("OrderStatuses", &last_order_statuses)] {
-                    let ts = last.load(std::sync::atomic::Ordering::Relaxed);
+                    let ts = last.load(Ordering::Relaxed);
                     if ts > 0 && now_ms.saturating_sub(ts) > WATCHER_STALL_ALARM_MS {
                         error!(
                             "{name} watcher has produced no events for {}s - node stream stalled?",
@@ -1306,12 +1668,22 @@ pub async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, config: crat
                 }
 
                 let (is_ready, needs_resync) = {
+                    let wait_start = Instant::now();
                     let guard = listener.lock().await;
-                    (guard.is_ready(), guard.needs_resync())
+                    LISTENER_LOCK_WAIT_LATENCY
+                        .with_label_values(&["ticker_status"])
+                        .observe(wait_start.elapsed().as_secs_f64());
+                    let hold_start = Instant::now();
+                    let status = (guard.is_ready(), guard.needs_resync());
+                    LISTENER_LOCK_HOLD_LATENCY
+                        .with_label_values(&["ticker_status"])
+                        .observe(hold_start.elapsed().as_secs_f64());
+                    status
                 };
                 info!("Ticker: is_ready={is_ready}, needs_resync={needs_resync}, snapshot_fetch_pending={snapshot_fetch_pending}");
                 if (!is_ready || needs_resync) && !snapshot_fetch_pending {
                     snapshot_fetch_pending = true;
+                    SNAPSHOT_FETCH_PENDING.set(1);
                     let listener = listener.clone();
                     let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
                     fetch_snapshot(snapshot_config.clone(), listener, snapshot_fetch_task_tx, ignore_spot);
@@ -1330,7 +1702,13 @@ mod tests {
     /// broadcast receiver so `receiver_count() > 0`.
     fn ready_listener() -> (OrderBookListener, tokio::sync::broadcast::Receiver<Arc<InternalMessage>>) {
         let (tx, rx) = tokio::sync::broadcast::channel(32);
-        let mut listener = OrderBookListener::new(Some(tx), true, ActiveL2Params::new(), (true, true, true));
+        let mut listener = OrderBookListener::new(
+            Some(tx),
+            true,
+            ActiveL2Params::new(),
+            ActiveSubscriptionInterests::new(),
+            (true, true, true),
+        );
         listener.init_from_snapshot(Snapshots::new(HashMap::new()), 0);
         (listener, rx)
     }
@@ -1477,7 +1855,13 @@ mod tests {
     #[test]
     fn test_startup_events_cached_and_replayed_above_snapshot_height() {
         let (tx, _rx) = tokio::sync::broadcast::channel(32);
-        let mut listener = OrderBookListener::new(Some(tx), false, ActiveL2Params::new(), (true, true, true));
+        let mut listener = OrderBookListener::new(
+            Some(tx),
+            false,
+            ActiveL2Params::new(),
+            ActiveSubscriptionInterests::new(),
+            (true, true, true),
+        );
         assert!(!listener.is_ready());
 
         // Events stream in while the snapshot is being generated (book not ready).
@@ -1518,7 +1902,13 @@ mod tests {
     #[test]
     fn test_cache_overflow_keeps_book_desynced_until_clean_resync() {
         let (tx, _rx) = tokio::sync::broadcast::channel(32);
-        let mut listener = OrderBookListener::new(Some(tx), true, ActiveL2Params::new(), (true, true, true));
+        let mut listener = OrderBookListener::new(
+            Some(tx),
+            true,
+            ActiveL2Params::new(),
+            ActiveSubscriptionInterests::new(),
+            (true, true, true),
+        );
         listener.set_cache_event_cap(1);
 
         feed_order(&mut listener, "AAA", 1, 10); // 2 single-event batches: second one overflows
@@ -1690,6 +2080,7 @@ mod tests {
     #[test]
     fn test_fills_broadcast_grouped_by_coin() {
         let (mut listener, mut rx) = ready_listener();
+        let _interest = listener.active_subscription_interests().acquire(SubscriptionInterest::Trades);
         listener.apply_event_batch(
             1,
             EventBatch::Fills(make_fills_batch(&["BTC", "ETH", "BTC"], 1)),
@@ -1734,10 +2125,10 @@ mod tests {
             }))
             .unwrap()
         };
-        let mut p = TradePairer::default();
+        let mut p = payload_groups::TradePairer::default();
         // Seller (ask) crossed => taker => aggressor side "A".
-        assert!(p.group(leg(5, "A", true, "0x0000000000000000000000000000000000000002")).is_empty());
-        let grouped = p.group(leg(5, "B", false, "0x0000000000000000000000000000000000000001"));
+        assert!(p.group_by_coin(leg(5, "A", true, "0x0000000000000000000000000000000000000002")).is_empty());
+        let grouped = p.group_by_coin(leg(5, "B", false, "0x0000000000000000000000000000000000000001"));
         assert_eq!(grouped["BTC"].trades.len(), 1);
         assert_eq!(serde_json::to_value(&grouped["BTC"].trades[0]).unwrap()["side"], "A");
     }
@@ -1747,13 +2138,13 @@ mod tests {
         // The wire format is public API: the shared frame must be byte-identical
         // to what the old per-connection serde_json::to_string path produced.
         use crate::types::subscription::ServerResponse;
-        let grouped = TradePairer::default().group(make_fills_batch(&["BTC"], 1));
+        let grouped = payload_groups::TradePairer::default().group_by_coin(make_fills_batch(&["BTC"], 1));
         let ct = grouped.get("BTC").unwrap();
         let expected = serde_json::to_string(&ServerResponse::Trades(Arc::clone(&ct.trades))).unwrap();
-        let frame = ct.frame.get_or_serialize(|| ServerResponse::Trades(Arc::clone(&ct.trades)));
+        let frame = ct.frame.get_or_serialize("trades", || ServerResponse::Trades(Arc::clone(&ct.trades)));
         assert_eq!(frame.as_ref(), expected.as_bytes());
         // A second call returns the cached frame without re-serializing.
-        let again = ct.frame.get_or_serialize(|| -> ServerResponse { panic!("frame must be cached") });
+        let again = ct.frame.get_or_serialize("trades", || -> ServerResponse { panic!("frame must be cached") });
         assert_eq!(again, frame);
     }
 
@@ -1761,28 +2152,30 @@ mod tests {
     fn test_l2_frame_cache_builds_once_and_is_byte_identical() {
         // The wire format is public API: the cached frame must be byte-identical
         // to what the old per-connection serde_json::to_string path produced,
-        // and a second lookup must NOT re-run the build closure.
+        // and a second lookup must return the same cached Arc.
         use crate::types::subscription::ServerResponse;
         let cache = L2FrameCache::new();
-        let build = || {
-            let levels = [vec![crate::types::Level::new("100.0".to_string(), "1.5".to_string(), 2)], Vec::new()];
-            let l2_book = L2Book::from_l2_snapshot("BTC".to_string(), levels, 1000, Some(5), None, Some(20));
-            let frame = bytes::Bytes::from(serde_json::to_string(&ServerResponse::L2Book(l2_book.clone())).unwrap());
-            (42_u64, frame, l2_book)
-        };
-        let key = || L2FrameKey::new("BTC", Some(5), None, 20);
+        let expected_payload =
+            L2Book::from_l2_snapshot("BTC".to_string(), [Vec::new(), Vec::new()], 1000, Some(5), None, Some(20));
+        let expected_frame =
+            bytes::Bytes::from(serde_json::to_string(&ServerResponse::L2Book(expected_payload.clone())).unwrap());
 
-        let first = cache.get_or_build(key(), build);
-        let (_, expected_frame, expected_payload) = build();
-        assert_eq!(first.1, expected_frame, "cached frame must match direct serialization byte-for-byte");
-        assert_eq!(first.0, 42, "dedup hash is carried through");
+        let first = cache.get_or_build("BTC", Some(5), None, 20, 1000, None);
+        assert_eq!(
+            first.websocket_frame(),
+            expected_frame,
+            "cached frame must match direct serialization byte-for-byte"
+        );
 
-        let second = cache.get_or_build(key(), || panic!("the build closure must not run on a cache hit"));
+        let second = cache.get_or_build("BTC", Some(5), None, 20, 1000, None);
         assert!(Arc::ptr_eq(&first, &second), "the cached Arc is shared");
-        assert_eq!(serde_json::to_string(&second.2).unwrap(), serde_json::to_string(&expected_payload).unwrap());
+        assert_eq!(
+            serde_json::to_string(&second.payload_clone()).unwrap(),
+            serde_json::to_string(&expected_payload).unwrap()
+        );
 
         // A different n_levels is a different payload - distinct cache slot.
-        let other = cache.get_or_build(L2FrameKey::new("BTC", Some(5), None, 50), build);
+        let other = cache.get_or_build("BTC", Some(5), None, 50, 1000, None);
         assert!(!Arc::ptr_eq(&first, &other));
     }
 
@@ -1791,6 +2184,7 @@ mod tests {
         // ready_listener runs with ignore_spot=true: the spot coin's diff must
         // be stripped from the broadcast grouping too.
         let (mut listener, mut rx) = ready_listener();
+        let _interest = listener.active_subscription_interests().acquire(SubscriptionInterest::BookDiffs);
         listener.apply_event_batch(
             1,
             EventBatch::BookDiffs(make_multi_diff_batch(&["BTC", "@1", "BTC"], 1)),
@@ -1813,6 +2207,7 @@ mod tests {
     #[test]
     fn test_all_spot_diff_batch_broadcasts_nothing() {
         let (mut listener, mut rx) = ready_listener(); // ignore_spot=true
+        let _interest = listener.active_subscription_interests().acquire(SubscriptionInterest::BookDiffs);
         listener.apply_event_batch(
             1,
             EventBatch::BookDiffs(make_multi_diff_batch(&["@1"], 1)),
@@ -1829,17 +2224,33 @@ mod tests {
     #[test]
     fn test_statuses_broadcast_grouped_by_coin() {
         let (mut listener, mut rx) = ready_listener();
+        let _l4_interest = listener.active_subscription_interests().acquire(SubscriptionInterest::L4Book);
+        let _updates_interest = listener.active_subscription_interests().acquire(SubscriptionInterest::OrderUpdates);
         listener.apply_event_batch(7, EventBatch::Orders(make_status_batch("BTC", 1, 7)), EventSource::OrderStatuses);
 
         let mut found = false;
         while let Ok(msg) = rx.try_recv() {
-            if let InternalMessage::L4OrderStatuses { height, statuses_by_coin, .. } = msg.as_ref() {
+            if let InternalMessage::L4OrderStatuses { height, statuses_by_coin, statuses_by_user, .. } = msg.as_ref() {
                 assert_eq!(*height, 7);
                 assert_eq!(statuses_by_coin.get("BTC").map(|s| s.statuses.len()), Some(1));
+                assert_eq!(statuses_by_user.values().next().map(|s| s.statuses.len()), Some(1));
                 found = true;
             }
         }
         assert!(found, "a grouped L4OrderStatuses message must be broadcast");
+    }
+
+    #[test]
+    fn test_statuses_broadcast_skipped_without_active_interest() {
+        let (mut listener, mut rx) = ready_listener();
+        listener.apply_event_batch(7, EventBatch::Orders(make_status_batch("BTC", 1, 7)), EventSource::OrderStatuses);
+
+        while let Ok(msg) = rx.try_recv() {
+            assert!(
+                !matches!(msg.as_ref(), InternalMessage::L4OrderStatuses { .. }),
+                "statuses should not be grouped or broadcast when no L4/orderUpdates subscription exists"
+            );
+        }
     }
 
     // ==================== Parse / apply split ====================
@@ -1906,5 +2317,18 @@ mod tests {
         assert!(reg.snapshot().contains(&p), "shape still referenced by g1");
         drop(g1);
         assert!(reg.snapshot().is_empty());
+    }
+
+    #[test]
+    fn test_active_subscription_interest_guard_decrements_on_drop() {
+        let active = ActiveSubscriptionInterests::new();
+        let first = active.acquire(SubscriptionInterest::Bbo);
+        let second = active.acquire(SubscriptionInterest::Bbo);
+
+        assert!(active.has(SubscriptionInterest::Bbo));
+        drop(first);
+        assert!(active.has(SubscriptionInterest::Bbo), "one remaining guard keeps the interest active");
+        drop(second);
+        assert!(!active.has(SubscriptionInterest::Bbo));
     }
 }

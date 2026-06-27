@@ -92,8 +92,10 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
         SnapshotMode::Direct => {
             // Direct mode: run hl-node directly on host
             let abci_path = resolve_abci_state_path(config);
-            let output_path =
-                config.snapshot_output_path.clone().unwrap_or_else(|| PathBuf::from("/tmp/hl_snapshot.json"));
+            let output_path = config
+                .snapshot_output_path
+                .clone()
+                .unwrap_or_else(|| std::env::temp_dir().join(default_snapshot_filename()));
             let visor_path =
                 config.visor_state_path.clone().unwrap_or_else(|| get_default_visor_path(&config.data_dir));
 
@@ -182,7 +184,11 @@ fn get_default_visor_path(data_dir: &Path) -> PathBuf {
 }
 
 fn get_default_docker_snapshot_output_path(parent_dir: &Path) -> PathBuf {
-    parent_dir.join("hyperliquid_data/orderbook_snapshot.json")
+    parent_dir.join("hyperliquid_data").join(default_snapshot_filename())
+}
+
+fn default_snapshot_filename() -> String {
+    format!("orderbook_snapshot_{}.json", std::process::id())
 }
 
 fn docker_container_path(host_path: &Path, host_root: &Path) -> PathBuf {
@@ -365,6 +371,24 @@ pub(super) enum EventBatch {
     Fills(Batch<NodeDataFill>),
 }
 
+impl EventBatch {
+    pub(super) fn block_time(&self) -> u64 {
+        match self {
+            Self::Orders(batch) => batch.block_time(),
+            Self::BookDiffs(batch) => batch.block_time(),
+            Self::Fills(batch) => batch.block_time(),
+        }
+    }
+
+    pub(super) fn local_time(&self) -> u64 {
+        match self {
+            Self::Orders(batch) => batch.local_time(),
+            Self::BookDiffs(batch) => batch.local_time(),
+            Self::Fills(batch) => batch.local_time(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,10 +484,16 @@ mod tests {
     #[test]
     fn test_default_docker_snapshot_output_uses_mounted_dir() {
         let host_path = get_default_docker_snapshot_output_path(Path::new("/data/hl"));
-        assert_eq!(host_path, PathBuf::from("/data/hl/hyperliquid_data/orderbook_snapshot.json"));
+        assert_eq!(host_path.parent(), Some(Path::new("/data/hl/hyperliquid_data")));
+        assert!(
+            host_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| { name.starts_with("orderbook_snapshot_") && name.ends_with(".json") })
+        );
         assert_eq!(
             docker_container_path(&host_path, Path::new("/data/hl")),
-            PathBuf::from("hl/hyperliquid_data/orderbook_snapshot.json")
+            PathBuf::from("hl/hyperliquid_data").join(host_path.file_name().unwrap())
         );
     }
 

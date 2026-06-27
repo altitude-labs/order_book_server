@@ -101,8 +101,9 @@ struct Args {
     #[arg(long)]
     abci_state_path: Option<PathBuf>,
 
-    /// Path where snapshot.json will be written (only used in direct mode).
-    /// Default: /tmp/hl_snapshot.json
+    /// Path where snapshot JSON will be written.
+    /// Default: process-specific orderbook_snapshot_<pid>.json in the node data
+    /// hyperliquid_data directory (docker mode) or system temp dir (direct mode).
     #[arg(long)]
     snapshot_output_path: Option<PathBuf>,
 
